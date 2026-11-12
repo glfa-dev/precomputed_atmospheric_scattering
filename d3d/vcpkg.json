@@ -1,0 +1,14 @@
+{
+  "name": "atmosphere-d3d12",
+  "version-string": "1.0.0",
+  "description": "HLSL / Direct3D 12 sample of Precomputed Atmospheric Scattering",
+  "dependencies": [
+    "directx-dxc",
+    "directx-headers",
+    {
+      "name": "imgui",
+      "features": [ "dx12-binding", "win32-binding" ]
+    }
+  ],
+  "builtin-baseline": "594ad8871e1e8e45f8e626c015fd611163430207"
+}

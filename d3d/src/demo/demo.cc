@@ -398,7 +398,7 @@ preprocessor macros corresponding to the model options:
 }
 
 /*
-<p>The white point used for the final "tone mapping" is either (1,1,1), or the
+<p>The white point used for the final tone mapping is either (1,1,1), or the
 color of the solar spectrum, if white balance is enabled:
 */
 

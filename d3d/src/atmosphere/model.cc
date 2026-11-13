@@ -486,10 +486,11 @@ the precision of the numerical integration and of the texture interpolation,
 and except for the longest paths, near the horizon, where this exact color is
 outside the sRGB gamut - with a negative blue, or even green, component - which
 is clamped to 0). Note that, because of this, a low Sun rendered with a large
-exposure and a per channel tone mapping (as in our demo) can show a sharp
-white/yellow split inside the Sun disc, along the contour where the blue
-component becomes 0: the small positive blue values above it are saturated by
-the tone mapping, while the clamped values below it are not.
+exposure and a per channel tone mapping can show a sharp white/yellow split
+inside the Sun disc, along the contour where the blue component becomes 0: the
+small positive blue values above it are saturated by the tone mapping, while
+the clamped values below it are not (our demo uses a tone mapping which mixes
+the color channels, which avoids this).
 
 <p>This texture can't be used for the transmittance between two arbitrary points
 $\mathbf{p}$ and $\mathbf{q}$ (needed for the aerial perspective) though. For a

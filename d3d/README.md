@@ -86,9 +86,7 @@ this port (`a`, `c`, `f` and `u` below):
   the solar spectrum, integrated over each sRGB channel, which gives their
   exact colors, and the aerial perspective uses extinction coefficients
   averaged over each sRGB channel, instead of their values at 680, 550 and
-  440nm; this fixes too red and too bright sunsets; with a large exposure, a
-  low Sun can show a white/yellow split along the contour where its blue
-  component becomes 0, an effect of the per channel tone mapping),
+  440nm; this fixes too red and too bright sunsets),
 - `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
   are averaged over the linear sRGB channels, weighted by the solar spectrum,
   instead of being sampled at 680, 550 and 440nm; radiance mode only),
@@ -116,6 +114,9 @@ saves the last one and exits (D3D12 debug layer messages, if any, are written to
   the shaders.
 - All the precomputed textures use RGBA formats (RGB formats can't be used for
   unordered access views).
+- The demo uses the AgX tone mapping instead of the `1 - exp(-x)` curve of the
+  OpenGL demo. Its implementation is a port of the one of the Godot Engine,
+  under the MIT license (see the notice in `shaders/demo/demo.hlsl`).
 - Note: the precomputation of the scattering density is the most expensive
   dispatch (about 10 ms per scattering order on a recent GPU). On very slow GPUs,
   this dispatch could be split into several ones (e.g. one per 3D texture layer,

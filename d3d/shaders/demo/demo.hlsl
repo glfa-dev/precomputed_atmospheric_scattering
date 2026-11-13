@@ -396,6 +396,107 @@ void GetSphereShadowInOut(float3 view_direction, float3 sun_direction,
   }
 }
 
+/*<h3>Tone mapping</h3>
+
+<p>The final radiance (or luminance) values must be mapped to displayable
+values. A simple per channel curve such as $1-\exp(-x)$ compresses each
+channel independently, which shifts the hue of bright saturated colors (e.g.
+the low Sun turns yellow then white, with a sharp split where its blue
+component becomes 0). Instead, we use
+<a href="https://github.com/sobotka/AgX">AgX</a>, which first mixes the color
+channels with an "inset" matrix (so that very bright colors desaturate
+smoothly towards white), then applies a sigmoid curve in log2 space (covering
+16.5 stops around middle gray), and finally an "outset" matrix restoring some
+of the chroma. The following code is a port of the AgX implementation of the
+<a href="https://godotengine.org">Godot Engine</a> (version 4.4-stable,
+<code>servers/rendering/renderer_rd/shaders/effects/tonemap.glsl</code>), which
+is distributed under the license below (Godot's code is itself an
+approximation of <a href="https://github.com/EaryChow/AgX_LUT_Gen">EaryChow's
+AgX</a>, used by Blender). Note that AgX expects linear sRGB (Rec.709) inputs,
+which is only approximately the case in radiance mode, where the RGB channels
+are the spectral radiance at 680, 550 and 440nm (unless the Rec.709
+band-averaged coefficients option is used). The Godot license is:
+
+<pre>
+Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
+Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</pre>
+
+<p>The sigmoid curve is approximated with a polynomial (fitted by the Godot
+authors to EaryChow's curve):
+*/
+
+float3 AgxContrastApprox(float3 x) {
+  float3 x2 = x * x;
+  float3 x4 = x2 * x2;
+  return 0.021 * x + 4.0111 * x2 - 25.682 * x2 * x + 70.359 * x4 -
+      74.778 * x4 * x + 27.069 * x4 * x2;
+}
+
+/*
+<p>The AgX transform itself takes and returns linear sRGB values. Note that the
+GLSL matrices are column major, and are used as <code>M * color</code>. We use
+the same coefficients in the same order in HLSL, where they define the rows of
+the matrices, with <code>mul(color, M)</code>, which gives the same result:
+*/
+
+float3 AgxToneMap(float3 color) {
+  // Combined linear sRGB to linear Rec 2020 and Blender AgX inset matrices.
+  static const float3x3 kSrgbToRec2020AgxInset = float3x3(
+      0.54490813676363087053, 0.14044005884001287035, 0.088827411851915368603,
+      0.37377945959812267119, 0.75410959864013760045, 0.17887712465043811023,
+      0.081384976686407536266, 0.10543358536857773485, 0.73224999956948382528);
+  // Combined inverse AgX outset and linear Rec 2020 to linear sRGB matrices.
+  static const float3x3 kAgxOutsetRec2020ToSrgb = float3x3(
+      1.9645509602733325934, -0.29932243390911083839, -0.16436833806080403409,
+      -0.85585845117807513559, 1.3264510741502356555, -0.23822464068860595117,
+      -0.10886710826831608324, -0.027084020983874825605, 1.402665347143271889);
+  // log2(pow(2, -10) * 0.18) and log2(pow(2, 6.5) * 0.18), i.e. 10 stops
+  // below and 6.5 stops above middle gray.
+  static const float kMinEv = -12.4739311883324;
+  static const float kMaxEv = 4.02606881166759;
+
+  // Negative inputs are not supported (and 2e-10 avoids log2(0) after the
+  // inset matrix).
+  color = max(color, 2e-10);
+  color = mul(color, kSrgbToRec2020AgxInset);
+  // Log2 encoding, clamped to [0,1] for the polynomial approximation.
+  color = (clamp(log2(color), kMinEv, kMaxEv) - kMinEv) / (kMaxEv - kMinEv);
+  color = AgxContrastApprox(color);
+  // Back to linear, then outset matrix and conversion back to linear sRGB.
+  color = pow(color, 2.4);
+  return mul(color, kAgxOutsetRec2020ToSrgb);
+}
+
+/*
+<p>The result, clamped to [0,1], is then encoded with the sRGB transfer
+function (the swap chain uses a UNORM format):
+*/
+
+float3 LinearToSrgb(float3 color) {
+  color = saturate(color);
+  return select(color <= 0.0031308,
+      12.92 * color, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
+}
+
 /*<h3>Main shading function</h3>
 
 <p>Using these functions we can now implement the main shader function, which
@@ -561,7 +662,9 @@ the scene:
   }
   radiance = lerp(radiance, ground_radiance, ground_alpha);
   radiance = lerp(radiance, sphere_radiance, sphere_alpha);
-  return float4(
-      pow((float3)1.0 - exp(-radiance / white_point * exposure), 1.0 / 2.2),
+  // With the default exposure, this gives about the same mean display
+  // luminance as the 1 - exp(-x) curve of the OpenGL demo (0.93 to 1.18 times
+  // over the predefined views), with more contrast.
+  return float4(LinearToSrgb(AgxToneMap(radiance / white_point * exposure)),
       1.0);
 }

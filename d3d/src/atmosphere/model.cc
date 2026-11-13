@@ -442,6 +442,192 @@ std::vector<std::array<double, 3>> FitWavelengthRuleWeights(
 }
 
 /*
+<h4 id="sun_transmittance">Spectral sun transmittance</h4>
+
+<p>In precomputed illuminance mode, the scattering textures are integrated over
+the whole spectrum but, in the OpenGL version, the transmittance texture
+contains the transmittance $T(\lambda)$ at the 3 wavelengths
+<code>kLambdaR</code>, <code>kLambdaG</code>, <code>kLambdaB</code> only. The
+Sun disc, the direct sunlight on surfaces and the aerial perspective are then
+computed as this transmittance times linear sRGB values, for instance $T(680)
+\int S\bar{r}d\lambda$ for the red channel of the Sun disc, instead of the
+correct value $\int ST\bar{r}d\lambda$. This is only correct if $T$ is constant
+over each channel, which is far from being the case for long optical paths: the
+Rayleigh extinction varies like $\lambda^{-4}$, and the ozone absorption has a
+large peak around 600nm. For instance, near sunset, the transmittance at 680nm
+is much larger than its average over the red channel (which is mostly sensitive
+around 600nm), which gives too red and too bright sunsets. To give an idea of
+these errors, we evaluated them with a simple offline single scattering model
+(not included here), for a ground observer, Sun zenith angles between 0 and 90
+degrees, and horizontal view paths up to 150km, compared with a 1nm spectral
+integration: the mean CIEDE2000 chroma error was about 5.6, and the mean
+luminance error about 40% (these figures are only indicative).
+
+<p>The <code>spectral_sun_transmittance</code> option fixes this in two parts.
+First, the Sun light reaching a point $\mathbf{p}$ at radius $r$, with a Sun
+zenith angle cosine $\mu_s$, has been attenuated along the path from the top of
+the atmosphere to $\mathbf{p}$, which only depends on $(r,\mu_s)$. Its exact
+linear sRGB color is thus
+$\int S(\lambda)T(\lambda;r,\mu_s)\bar{c}(\lambda)d\lambda$, which we can
+precompute in a texture with the same parameterization as the transmittance
+texture. More precisely, we store the "effective" transmittance
+$$T_{\mathrm{eff},c}(r,\mu)=\frac{\int S(\lambda)T(\lambda;r,\mu)\bar{c}
+(\lambda)d\lambda}{\int S(\lambda)\bar{c}(\lambda)d\lambda}$$
+whose denominator is the linear sRGB color of the Sun outside the atmosphere,
+i.e. the value returned by <code>GetSolarLuminance</code> (up to a constant
+factor): indeed, <code>sun_spectral_radiance_to_luminance</code> is
+<code>MAX_LUMINOUS_EFFICACY</code> times $\int S\bar{c}d\lambda$ divided by $S$
+at <code>kLambdaR</code>, <code>kLambdaG</code> or <code>kLambdaB</code> (see
+<code>ComputeSpectralRadianceToLuminanceFactors</code>), and
+<code>GetSolarLuminance</code> multiplies it with $S$ at these wavelengths.
+Thus <code>GetSolarLuminance</code> times $T_{\mathrm{eff}}$ gives the exact
+color of the attenuated Sun disc, and of the direct sunlight on surfaces (up to
+the precision of the numerical integration and of the texture interpolation,
+and except for the longest paths, near the horizon, where this exact color is
+outside the sRGB gamut - with a negative blue, or even green, component - which
+is clamped to 0). Note that, because of this, a low Sun rendered with a large
+exposure and a per channel tone mapping (as in our demo) can show a sharp
+white/yellow split inside the Sun disc, along the contour where the blue
+component becomes 0: the small positive blue values above it are saturated by
+the tone mapping, while the clamped values below it are not.
+
+<p>This texture can't be used for the transmittance between two arbitrary points
+$\mathbf{p}$ and $\mathbf{q}$ (needed for the aerial perspective) though. For a
+single wavelength this transmittance is the ratio of the transmittances from
+$\mathbf{p}$ and from $\mathbf{q}$ to the top of the atmosphere (see
+<code>GetTransmittance</code>), but this is not true for $T_{\mathrm{eff}}$,
+since the ratio of two spectral averages is not the average of the ratio (in
+the above offline model, using this ratio for the segments gives large chroma
+errors, about twice as large as with the 3 wavelengths transmittance).
+Moreover, the light transmitted along such segments does not have the
+solar spectrum (e.g. it is reflected by the ground, or scattered by the
+atmosphere), so a single effective transmittance can't be exact anyway.
+Instead, the second part of this option computes the (normal) transmittance
+texture with the extinction coefficients $\beta(\lambda)$ of each component
+(Rayleigh, Mie and absorption) replaced with their averages over each linear
+sRGB channel $c$, weighted by the solar spectrum:
+$$\beta_c=\frac{\int S(\lambda)\beta(\lambda)\bar{c}(\lambda)d\lambda}
+{\int S(\lambda)\bar{c}(\lambda)d\lambda}$$
+This keeps the ratio property of a single wavelength transmittance and, for
+short paths (where $T\approx 1-\beta l$), gives the exact color of the
+attenuated sunlight, to first order in the optical depth (the point sampled
+values are not even exact to first order). With both parts, the errors of the
+above offline model drop to about 1.7 (chroma) and 4% (luminance), the
+remaining errors coming only from the aerial perspective (the Sun disc and the
+direct sunlight being exact).
+
+<p>The band-averaged coefficients are computed as in the demo's "Rec.709
+band-averaged coefficients" option, but here only for the extinction
+coefficients, and only for the transmittance texture. The products
+$S(\lambda)\beta(\lambda)$ are computed at the input wavelengths, and then
+integrated with <code>ConvertSpectrumToLinearSrgb</code>. If the solar color is
+not positive in some channel (e.g. with a null solar spectrum), we fall back to
+the point sampled value in this channel:
+*/
+
+// Returns the averages of 'spectrum' over the 3 linear sRGB channels, weighted
+// by 'solar_irradiance' (and clamped to non-negative values, since the signed
+// color matching functions can give slightly negative values, e.g. for the
+// ozone absorption in the blue channel), times 'scale'.
+hlsl::float3 ComputeBandAverage(const std::vector<double>& wavelengths,
+                                const std::vector<double>& solar_irradiance,
+                                const std::vector<double>& spectrum,
+                                double scale) {
+  std::vector<double> weighted(wavelengths.size());
+  for (size_t i = 0; i < wavelengths.size(); ++i) {
+    weighted[i] = solar_irradiance[i] * spectrum[i];
+  }
+  double solar[3];
+  double weighted_rgb[3];
+  Model::ConvertSpectrumToLinearSrgb(wavelengths, solar_irradiance,
+                                     &solar[0], &solar[1], &solar[2]);
+  Model::ConvertSpectrumToLinearSrgb(wavelengths, weighted, &weighted_rgb[0],
+                                     &weighted_rgb[1], &weighted_rgb[2]);
+  const double lambdas[3] = {Model::kLambdaR, Model::kLambdaG,
+                             Model::kLambdaB};
+  hlsl::float3 result;
+  for (int c = 0; c < 3; ++c) {
+    double value = solar[c] > 0.0
+        ? std::max(weighted_rgb[c] / solar[c], 0.0)
+        : Interpolate(wavelengths, spectrum, lambdas[c]);
+    result[c] = static_cast<float>(value * scale);
+  }
+  return result;
+}
+
+/*
+<p>The effective transmittance texture is computed with a numerical
+integration over the wavelength, with the same 1nm step as in
+<code>ConvertSpectrumToLinearSrgb</code> (i.e. 470 samples between 360 and
+829nm), so that its denominator is exactly the solar color returned by
+<code>GetSolarLuminance</code>. Since the 3 optical lengths to the top of the
+atmosphere (one per density profile) don't depend on the wavelength, each texel
+only needs these 3 integrals (as for the normal transmittance texture), plus
+470 exponentials. The shader (in <a href=
+"../../shaders/atmosphere/precompute.hlsl.html">precompute.hlsl</a>) gets the
+extinction coefficients $\beta_R,\beta_M^{ext},\beta_O^{ext}$ (in inverse
+length units) and the normalized weights $S\bar{c}/\int S\bar{c}d\lambda$ at
+each wavelength from the following constant buffer, which we fill in the
+constructor (the input spectra are linearly interpolated at each wavelength;
+if the solar color is not positive in some channel, all the weight is put on
+the sample closest to <code>kLambdaR</code>, <code>kLambdaG</code> or
+<code>kLambdaB</code>, which then gives the point sampled transmittance in this
+channel):
+*/
+
+constexpr int kSunTransmittanceSpectrumSize = kLambdaMax - kLambdaMin;
+
+struct SunTransmittanceSpectrum {
+  // Rayleigh, Mie and absorption extinction coefficients (and padding).
+  float extinction[kSunTransmittanceSpectrumSize][4];
+  // Normalized weights of the R, G, B channels (and padding).
+  float weights[kSunTransmittanceSpectrumSize][4];
+};
+static_assert(sizeof(SunTransmittanceSpectrum) ==
+              2 * kSunTransmittanceSpectrumSize * 4 * sizeof(float));
+
+std::vector<std::array<float, 4>> ComputeSunTransmittanceSpectrum(
+    const std::vector<double>& wavelengths,
+    const std::vector<double>& solar_irradiance,
+    const std::vector<double>& rayleigh_scattering,
+    const std::vector<double>& mie_extinction,
+    const std::vector<double>& absorption_extinction,
+    double length_unit_in_meters) {
+  constexpr int kSize = kSunTransmittanceSpectrumSize;
+  std::vector<std::array<float, 4>> result(2 * kSize);
+  std::vector<std::array<double, 3>> weights(kSize);
+  double weight_sums[3] = {0.0, 0.0, 0.0};
+  for (int j = 0; j < kSize; ++j) {
+    const double lambda = kLambdaMin + j;
+    result[j] = {
+        static_cast<float>(Interpolate(wavelengths, rayleigh_scattering,
+                                       lambda) * length_unit_in_meters),
+        static_cast<float>(Interpolate(wavelengths, mie_extinction, lambda) *
+                           length_unit_in_meters),
+        static_cast<float>(Interpolate(wavelengths, absorption_extinction,
+                                       lambda) * length_unit_in_meters),
+        0.0f};
+    const double solar = Interpolate(wavelengths, solar_irradiance, lambda);
+    for (int c = 0; c < 3; ++c) {
+      weights[j][c] = SrgbColorMatchingFunction(lambda, c) * solar;
+      weight_sums[c] += weights[j][c];
+    }
+  }
+  const double lambdas[3] = {Model::kLambdaR, Model::kLambdaG,
+                             Model::kLambdaB};
+  for (int c = 0; c < 3; ++c) {
+    const int fallback_index = std::clamp(
+        static_cast<int>(std::lround(lambdas[c])) - kLambdaMin, 0, kSize - 1);
+    for (int j = 0; j < kSize; ++j) {
+      double weight = weight_sums[c] > 0.0 ? weights[j][c] / weight_sums[c]
+                                           : (j == fallback_index ? 1.0 : 0.0);
+      result[kSize + j][c] = static_cast<float>(weight);
+    }
+  }
+  return result;
+}
+
+/*
 <p>We also need the C++ mirrors of the constant buffer and of the root constants
 of the precomputation shaders (see <a href=
 "../../shaders/atmosphere/precompute.hlsl.html">precompute.hlsl</a>). Note that
@@ -563,14 +749,17 @@ Model::Model(
     bool combine_scattering_textures,
     bool half_precision,
     bool accumulate_in_float32,
-    WavelengthRule wavelength_rule) :
+    WavelengthRule wavelength_rule,
+    bool spectral_sun_transmittance) :
         device_(device),
         descriptor_heap_(descriptor_heap),
         shader_compiler_(shader_compiler),
         num_precomputed_wavelengths_(num_precomputed_wavelengths),
         combine_scattering_textures_(combine_scattering_textures),
         half_precision_(half_precision),
-        accumulate_in_float32_(accumulate_in_float32) {
+        accumulate_in_float32_(accumulate_in_float32),
+        spectral_sun_transmittance_(
+            spectral_sun_transmittance && num_precomputed_wavelengths > 3) {
   // Note: the wavelengths are captured by value, because this lambda is used
   // by atmosphere_parameters_factory_, which can be called after the
   // constructor's arguments have been destroyed (at each Init call).
@@ -655,6 +844,38 @@ Model::Model(
   };
   atmosphere_parameters_ =
       atmosphere_parameters_factory_({kLambdaR, kLambdaG, kLambdaB});
+
+/*
+<p>With the <code>spectral_sun_transmittance</code> option, the constructor
+also computes the atmosphere parameters used for the final transmittance
+texture, and the spectral tables used for the sun transmittance texture (see
+the <a href="#sun_transmittance">utility functions</a>). Note that only the
+transmittance texture uses the band-averaged extinction coefficients. The
+atmosphere parameters returned by <code>atmosphere_parameters()</code>, used by
+the rendering shaders, are unchanged. Indeed, these shaders only read the solar
+irradiance (for <code>GetSolarLuminance</code>, already correct as explained
+above), the Sun angular radius, the radii and <code>mu_s_min</code> (for the
+texture coordinates), the Mie phase function parameter, and the Rayleigh and
+Mie scattering coefficients (only in the ratios used to extrapolate the single
+Mie scattering from the combined scattering texture). None of them is an
+extinction coefficient, and changing them would change the sky in-scattering,
+which is already integrated over the whole spectrum:
+*/
+
+  if (spectral_sun_transmittance_) {
+    transmittance_parameters_ = atmosphere_parameters_;
+    transmittance_parameters_.rayleigh_scattering = ComputeBandAverage(
+        wavelengths, solar_irradiance, rayleigh_scattering,
+        length_unit_in_meters);
+    transmittance_parameters_.mie_extinction = ComputeBandAverage(
+        wavelengths, solar_irradiance, mie_extinction, length_unit_in_meters);
+    transmittance_parameters_.absorption_extinction = ComputeBandAverage(
+        wavelengths, solar_irradiance, absorption_extinction,
+        length_unit_in_meters);
+    sun_transmittance_spectrum_ = ComputeSunTransmittanceSpectrum(
+        wavelengths, solar_irradiance, rayleigh_scattering, mie_extinction,
+        absorption_extinction, length_unit_in_meters);
+  }
 
 /*
 <p>In precomputed illuminance mode, the constructor also computes the
@@ -749,6 +970,12 @@ spacing:
   irradiance_texture_ = d3d12::Texture::Create2d(
       d3d_device, descriptor_heap_, IRRADIANCE_TEXTURE_WIDTH,
       IRRADIANCE_TEXTURE_HEIGHT, kTexture2dFormat, true, L"Irradiance texture");
+  if (spectral_sun_transmittance_) {
+    sun_transmittance_texture_ = d3d12::Texture::Create2d(
+        d3d_device, descriptor_heap_, TRANSMITTANCE_TEXTURE_WIDTH,
+        TRANSMITTANCE_TEXTURE_HEIGHT, kTexture2dFormat, true,
+        L"Sun transmittance texture");
+  }
 }
 
 /*
@@ -786,6 +1013,9 @@ std::vector<d3d12::ShaderDefine> Model::shader_defines() const {
   if (radiance_api_enabled()) {
     defines.push_back({"RADIANCE_API_ENABLED", ""});
   }
+  if (spectral_sun_transmittance_) {
+    defines.push_back({"SPECTRAL_SUN_TRANSMITTANCE", ""});
+  }
   return defines;
 }
 
@@ -807,6 +1037,10 @@ struct Model::Programs {
   d3d12::ComPtr<ID3D12PipelineState> compute_multiple_scattering;
   // Only used with the accumulate_in_float32 option (see below).
   d3d12::ComPtr<ID3D12PipelineState> convert_to_half;
+  // Only used with the spectral_sun_transmittance option. This shader uses an
+  // additional constant buffer, and thus its own root signature.
+  d3d12::ComPtr<ID3D12RootSignature> sun_transmittance_root_signature;
+  d3d12::ComPtr<ID3D12PipelineState> compute_sun_transmittance;
 };
 
 /*
@@ -900,6 +1134,17 @@ void Model::Init(unsigned int num_scattering_orders) {
   if (accumulate_in_float32) {
     convert_to_half_shader = compile("ConvertToHalfCS");
   }
+  d3d12::Shader sun_transmittance_shader;
+  if (spectral_sun_transmittance_) {
+    // The size of the spectral tables is passed with a macro, which must be
+    // defined to compile this entry point (see precompute.hlsl).
+    std::vector<d3d12::ShaderDefine> sun_defines = defines;
+    sun_defines.push_back({"SUN_TRANSMITTANCE_SPECTRUM_SIZE",
+                           std::to_string(kSunTransmittanceSpectrumSize)});
+    sun_transmittance_shader = shader_compiler_->Compile(
+        "atmosphere/precompute.hlsl", "ComputeSunTransmittanceCS", "cs_6_6",
+        sun_defines);
+  }
 #ifndef NDEBUG
   // Check that the C++ and HLSL constant buffer layouts are the same.
   auto members = hlsl::GetAtmosphereParametersLayout("constants.atmosphere", 0);
@@ -907,6 +1152,16 @@ void Model::Init(unsigned int num_scattering_orders) {
                      offsetof(PrecomputeConstants, luminance_from_radiance)});
   d3d12::ValidateConstantBufferLayout(shaders[2], "constants", members,
                                       sizeof(PrecomputeConstants));
+  if (spectral_sun_transmittance_) {
+    const d3d12::ConstantBufferMember spectrum_members[] = {
+        {"sun_transmittance_spectrum.extinction",
+         offsetof(SunTransmittanceSpectrum, extinction)},
+        {"sun_transmittance_spectrum.weights",
+         offsetof(SunTransmittanceSpectrum, weights)}};
+    d3d12::ValidateConstantBufferLayout(sun_transmittance_shader,
+        "sun_transmittance_spectrum", spectrum_members,
+        sizeof(SunTransmittanceSpectrum));
+  }
 #endif
   Programs programs;
   programs.root_signature =
@@ -932,6 +1187,15 @@ void Model::Init(unsigned int num_scattering_orders) {
   }
   if (accumulate_in_float32) {
     create_pipeline_state(convert_to_half_shader, &programs.convert_to_half);
+  }
+  if (spectral_sun_transmittance_) {
+    programs.sun_transmittance_root_signature =
+        d3d12::CreateRootSignature(d3d_device, sun_transmittance_shader);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = programs.sun_transmittance_root_signature.Get();
+    desc.CS = sun_transmittance_shader.GetBytecode();
+    D3D12_CHECK(d3d_device->CreateComputePipelineState(
+        &desc, IID_PPV_ARGS(&programs.compute_sun_transmittance)));
   }
 
   // Allocate the temporary textures.
@@ -985,13 +1249,19 @@ the contributions are directly accumulated in the final textures:
 
   // Allocate an upload buffer for the constants of each group of 3 wavelengths
   // (plus one for the final transmittance pass in precomputed illuminance
-  // mode), as well as a command list and a GPU timer.
+  // mode, and one for the spectral tables of the spectral_sun_transmittance
+  // option), as well as a command list and a GPU timer.
   const unsigned int num_iterations = wavelength_passes_.empty()
       ? 1 : static_cast<unsigned int>(wavelength_passes_.size());
+  const size_t spectrum_offset = kConstantsSize * (num_iterations + 1);
+  const size_t spectrum_size = spectral_sun_transmittance_
+      ? (sizeof(SunTransmittanceSpectrum) + kConstantBufferAlignment - 1) &
+            ~(kConstantBufferAlignment - 1)
+      : 0;
   d3d12::ComPtr<ID3D12Resource> constants_buffer;
   CD3DX12_HEAP_PROPERTIES upload_heap(D3D12_HEAP_TYPE_UPLOAD);
   auto buffer_desc =
-      CD3DX12_RESOURCE_DESC::Buffer(kConstantsSize * (num_iterations + 1));
+      CD3DX12_RESOURCE_DESC::Buffer(spectrum_offset + spectrum_size);
   D3D12_CHECK(d3d_device->CreateCommittedResource(
       &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
       D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -999,10 +1269,11 @@ the contributions are directly accumulated in the final textures:
   uint8_t* constants_data;
   D3D12_CHECK(constants_buffer->Map(
       0, nullptr, reinterpret_cast<void**>(&constants_data)));
-  auto set_constants = [&](unsigned int index, const vec3& lambdas,
+  auto set_constants = [&](unsigned int index,
+                           const hlsl::AtmosphereParameters& atmosphere,
                            const mat3& luminance_from_radiance) {
     PrecomputeConstants constants = {};
-    constants.atmosphere = atmosphere_parameters_factory_(lambdas);
+    constants.atmosphere = atmosphere;
     for (int row = 0; row < 3; ++row) {
       for (int column = 0; column < 3; ++column) {
         constants.luminance_from_radiance[row][column] =
@@ -1024,7 +1295,8 @@ the contributions are directly accumulated in the final textures:
   command_list->SetName(L"Atmosphere precomputation");
   d3d12::GpuTimer timer(d3d_device, device_->queue(),
       num_iterations * 3 * num_scattering_orders + 1 +
-          (accumulate_in_float32 ? 1 : 0));
+          (accumulate_in_float32 ? 1 : 0) +
+          (spectral_sun_transmittance_ ? 1 : 0));
 
   // The descriptor heap must be set before the root signature, since the root
   // signature uses the CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED flag.
@@ -1036,23 +1308,29 @@ the contributions are directly accumulated in the final textures:
     vec3 lambdas{kLambdaR, kLambdaG, kLambdaB};
     mat3 luminance_from_radiance{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
     Precompute(command_list.Get(), &timer, programs, textures,
-        set_constants(0, lambdas, luminance_from_radiance),
+        set_constants(0, atmosphere_parameters_factory_(lambdas),
+                      luminance_from_radiance),
         false /* blend */, num_scattering_orders);
   } else {
     for (unsigned int i = 0; i < num_iterations; ++i) {
       const WavelengthPass& pass = wavelength_passes_[i];
       Precompute(command_list.Get(), &timer, programs, textures,
-          set_constants(i, pass.lambdas, pass.luminance_from_radiance),
+          set_constants(i, atmosphere_parameters_factory_(pass.lambdas),
+                        pass.luminance_from_radiance),
           i > 0 /* blend */, num_scattering_orders);
     }
 
     // After the above iterations, the transmittance texture contains the
     // transmittance for the 3 wavelengths used at the last iteration. But we
-    // want the transmittance at kLambdaR, kLambdaG, kLambdaB instead, so we
-    // must recompute it here for these 3 wavelengths:
+    // want the transmittance at kLambdaR, kLambdaG, kLambdaB instead (or, with
+    // the spectral_sun_transmittance option, with the band-averaged extinction
+    // coefficients), so we must recompute it here:
     mat3 identity{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
     command_list->SetComputeRootConstantBufferView(0, set_constants(
-        num_iterations, {kLambdaR, kLambdaG, kLambdaB}, identity));
+        num_iterations, spectral_sun_transmittance_
+            ? transmittance_parameters_
+            : atmosphere_parameters_factory_({kLambdaR, kLambdaG, kLambdaB}),
+        identity));
     d3d12::Transition(command_list.Get(), {
         {&transmittance_texture_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}});
     PrecomputeResources resources = {};
@@ -1099,6 +1377,43 @@ the contributions are directly accumulated in the final textures:
               optional_single_mie_scattering_texture_);
     }
     timer.End(command_list.Get());
+  }
+
+/*
+<p>At the end, with the <code>spectral_sun_transmittance</code> option, we
+compute the sun transmittance texture (see the <a href="#sun_transmittance"
+>utility functions</a>), with a single dispatch. Its shader uses the same
+constant buffer as the final transmittance pass (for the radii and the density
+profiles), plus the spectral tables in an additional constant buffer, and thus
+its own root signature. Setting this root signature resets the root arguments,
+which must therefore be set again (we do this last, so that the other dispatches
+are not affected):
+*/
+
+  if (spectral_sun_transmittance_) {
+    memcpy(constants_data + spectrum_offset,
+           sun_transmittance_spectrum_.data(),
+           sizeof(SunTransmittanceSpectrum));
+    command_list->SetComputeRootSignature(
+        programs.sun_transmittance_root_signature.Get());
+    command_list->SetComputeRootConstantBufferView(0,
+        constants_buffer->GetGPUVirtualAddress() +
+            num_iterations * kConstantsSize);
+    command_list->SetComputeRootConstantBufferView(2,
+        constants_buffer->GetGPUVirtualAddress() + spectrum_offset);
+    d3d12::Transition(command_list.Get(), {
+        {&sun_transmittance_texture_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}});
+    PrecomputeResources resources = {};
+    resources.output0 = sun_transmittance_texture_.uav();
+    command_list->SetComputeRoot32BitConstants(
+        1, sizeof(resources) / 4, &resources, 0);
+    timer.Begin(command_list.Get(), "Sun transmittance");
+    command_list->SetPipelineState(programs.compute_sun_transmittance.Get());
+    command_list->Dispatch(GroupCount(TRANSMITTANCE_TEXTURE_WIDTH),
+                           GroupCount(TRANSMITTANCE_TEXTURE_HEIGHT), 1);
+    timer.End(command_list.Get());
+    d3d12::Transition(command_list.Get(), {
+        {&sun_transmittance_texture_, d3d12::Texture::kShaderResourceState}});
   }
 
   // Leave the precomputed textures in a state where they can be read by any

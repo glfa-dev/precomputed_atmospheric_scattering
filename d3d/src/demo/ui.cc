@@ -141,6 +141,19 @@ void Demo::DrawDemoWindow() {
     if (model_uses_rgb_coefficients_) {
       ImGui::TextDisabled("RGB coefficients: radiance mode only");
     }
+    ImGui::BeginDisabled(use_luminance_ != PRECOMPUTED);
+    changed |= ImGui::Checkbox("Spectral sun transmittance (u)",
+                               &settings_.spectral_sun_transmittance);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip(
+          "Precompute the transmittance of the solar spectrum, integrated\n"
+          "over each sRGB channel, for exact colors of the Sun disc and of\n"
+          "the direct sunlight, and use extinction coefficients averaged\n"
+          "over each sRGB channel (instead of their values at 680, 550 and\n"
+          "440nm) for the aerial perspective. Fixes too red and too bright\n"
+          "sunsets. Only in precomputed luminance mode.");
+    }
+    ImGui::EndDisabled();
     if (changed) {
       model_dirty_ = true;
     }
@@ -324,13 +337,31 @@ void Demo::DrawLutViewerWindow() {
     ImGui::End();
     return;
   }
-  const char* kTextures[] = {"Transmittance", "Irradiance", "Scattering",
-                             "Single Mie scattering"};
-  const int num_textures =
-      model_ && model_->optional_single_mie_scattering_texture() ? 4 : 3;
-  lut_index_ = std::min(lut_index_, num_textures - 1);
-  ImGui::Combo("Texture", &lut_index_, kTextures, num_textures);
-  const bool is_3d = lut_index_ >= 2;
+  // Each entry keeps the same meaning when the model options change. If the
+  // selected texture no longer exists, the transmittance texture is selected.
+  const auto textures = GetLutTextures();
+  const int num_textures = static_cast<int>(textures.size());
+  if (lut_index_ < 0 || lut_index_ >= num_textures ||
+      textures[lut_index_].second == nullptr) {
+    lut_index_ = 0;
+  }
+  if (ImGui::BeginCombo("Texture", textures[lut_index_].first)) {
+    for (int i = 0; i < num_textures; ++i) {
+      if (textures[i].second == nullptr) {
+        continue;
+      }
+      const bool selected = i == lut_index_;
+      if (ImGui::Selectable(textures[i].first, selected)) {
+        lut_index_ = i;
+      }
+      if (selected) {
+        ImGui::SetItemDefaultFocus();
+      }
+    }
+    ImGui::EndCombo();
+  }
+  const d3d12::Texture* texture = textures[lut_index_].second;
+  const bool is_3d = texture != nullptr && texture->is_3d();
   ImGui::BeginDisabled(!is_3d);
   ImGui::SliderInt("Slice (r)", &lut_slice_, 0, SCATTERING_TEXTURE_DEPTH - 1);
   ImGui::EndDisabled();
@@ -340,12 +371,9 @@ void Demo::DrawLutViewerWindow() {
 
   int width = TRANSMITTANCE_TEXTURE_WIDTH;
   int height = TRANSMITTANCE_TEXTURE_HEIGHT;
-  if (lut_index_ == 1) {
-    width = IRRADIANCE_TEXTURE_WIDTH;
-    height = IRRADIANCE_TEXTURE_HEIGHT;
-  } else if (is_3d) {
-    width = SCATTERING_TEXTURE_WIDTH;
-    height = SCATTERING_TEXTURE_HEIGHT;
+  if (texture != nullptr) {
+    width = static_cast<int>(texture->desc().Width);
+    height = static_cast<int>(texture->desc().Height);
   }
   // Display the texture with a width of 400 pixels, keeping its aspect ratio.
   const float kDisplayWidth = 400.0f;

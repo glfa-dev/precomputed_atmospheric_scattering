@@ -107,7 +107,10 @@ struct DemoResources {
   uint32_t scattering_texture;
   uint32_t single_mie_scattering_texture;
   uint32_t irradiance_texture;
+  uint32_t sun_transmittance_texture;
 };
+// Must be equal to the number of root constants declared in demo.hlsl.
+static_assert(sizeof(DemoResources) == 5 * sizeof(uint32_t));
 
 // The root constants of the LUT viewer shader (see lut_view.hlsl).
 struct LutViewParameters {
@@ -361,7 +364,8 @@ coefficients are passed to the
         s.max_sun_zenith_angle_degrees / 180.0 * kPi, kLengthUnitInMeters,
         use_luminance_ == PRECOMPUTED ? s.num_precomputed_wavelengths : 3,
         s.use_combined_textures, s.use_half_precision,
-        s.accumulate_in_float32, s.wavelength_rule);
+        s.accumulate_in_float32, s.wavelength_rule,
+        s.spectral_sun_transmittance);
     model->Init(s.num_scattering_orders);
   } catch (const std::exception& error) {
     error_message_ = error.what();
@@ -605,15 +609,21 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
          sizeof(constants));
 
   // When the scattering textures are combined, the scattering texture is
-  // passed as the (unused) single Mie scattering texture.
+  // passed as the (unused) single Mie scattering texture. Likewise, without
+  // the spectral sun transmittance option, the transmittance texture is passed
+  // as the (unused) sun transmittance texture.
   const d3d12::Texture* single_mie_scattering_texture =
       model_->optional_single_mie_scattering_texture();
+  const d3d12::Texture* sun_transmittance_texture =
+      model_->optional_sun_transmittance_texture();
   DemoResources resources = {
     model_->transmittance_texture().srv(),
     model_->scattering_texture().srv(),
     single_mie_scattering_texture ? single_mie_scattering_texture->srv()
                                   : model_->scattering_texture().srv(),
-    model_->irradiance_texture().srv()
+    model_->irradiance_texture().srv(),
+    sun_transmittance_texture ? sun_transmittance_texture->srv()
+                              : model_->transmittance_texture().srv()
   };
 
   D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(width),
@@ -625,7 +635,8 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
   command_list->SetGraphicsRootConstantBufferView(
       0, constants_buffer_->GetGPUVirtualAddress() +
              frame_index * kConstantsSize);
-  command_list->SetGraphicsRoot32BitConstants(1, 4, &resources, 0);
+  command_list->SetGraphicsRoot32BitConstants(
+      1, sizeof(resources) / 4, &resources, 0);
   command_list->RSSetViewports(1, &viewport);
   command_list->RSSetScissorRects(1, &scissor);
   command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -637,17 +648,28 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
 into an 8 bits texture which can then be displayed with Dear ImGui:
 */
 
-void Demo::RenderLutView(ID3D12GraphicsCommandList* command_list) {
-  const d3d12::Texture* textures[] = {
-    &model_->transmittance_texture(),
-    &model_->irradiance_texture(),
-    &model_->scattering_texture(),
-    model_->optional_single_mie_scattering_texture(),
+std::vector<std::pair<const char*, const d3d12::Texture*>>
+Demo::GetLutTextures() const {
+  const bool has_model = model_ != nullptr;
+  return {
+    {"Transmittance",
+     has_model ? &model_->transmittance_texture() : nullptr},
+    {"Irradiance", has_model ? &model_->irradiance_texture() : nullptr},
+    {"Scattering", has_model ? &model_->scattering_texture() : nullptr},
+    {"Single Mie scattering",
+     has_model ? model_->optional_single_mie_scattering_texture() : nullptr},
+    {"Sun transmittance",
+     has_model ? model_->optional_sun_transmittance_texture() : nullptr},
   };
-  const d3d12::Texture* source = textures[lut_index_];
-  if (source == nullptr) {
+}
+
+void Demo::RenderLutView(ID3D12GraphicsCommandList* command_list) {
+  const auto textures = GetLutTextures();
+  if (lut_index_ < 0 || lut_index_ >= static_cast<int>(textures.size()) ||
+      textures[lut_index_].second == nullptr) {
     return;
   }
+  const d3d12::Texture* source = textures[lut_index_].second;
   LutViewParameters parameters = {};
   parameters.source_texture = source->srv();
   parameters.is_3d = source->is_3d() ? 1 : 0;
@@ -714,6 +736,14 @@ void Demo::HandleKey(char key) {
     // The rule is only used in precomputed luminance mode. In the other modes,
     // the new value is used when switching to this mode (which re-creates the
     // model).
+    if (use_luminance_ == PRECOMPUTED) {
+      model_dirty_ = true;
+    }
+  } else if (key == 'u') {
+    settings_.spectral_sun_transmittance =
+        !settings_.spectral_sun_transmittance;
+    // As for the wavelength rule, this option is only used in precomputed
+    // luminance mode.
     if (use_luminance_ == PRECOMPUTED) {
       model_dirty_ = true;
     }

@@ -42,7 +42,11 @@ view ray with the shadow volume of S, in order to compute light shafts.
 <p>This file is compiled by the C++ demo with the preprocessor macros of the
 atmosphere model (see <code>Model::shader_defines()</code>), plus
 <code>USE_LUMINANCE</code> to render luminance values instead of radiance
-values, and <code>LENGTH_UNIT_IN_METERS</code>.
+values, and <code>LENGTH_UNIT_IN_METERS</code>. With the
+<code>SPECTRAL_SUN_TRANSMITTANCE</code> macro (only defined by the model in
+precomputed luminance mode), the Sun disc and the direct sunlight use the
+spectral sun transmittance texture (see
+<a href="../atmosphere/atmosphere.hlsli.html">atmosphere.hlsli</a>).
 
 <h3>Resources</h3>
 
@@ -54,7 +58,7 @@ descriptor heap indices provided in root constants:
 #define DEMO_ROOT_SIGNATURE \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)," \
     "CBV(b0)," \
-    "RootConstants(num32BitConstants=4, b1)," \
+    "RootConstants(num32BitConstants=5, b1)," \
     "StaticSampler(s0," \
     "    filter=FILTER_MIN_MAG_MIP_LINEAR," \
     "    addressU=TEXTURE_ADDRESS_CLAMP," \
@@ -102,6 +106,9 @@ struct DemoResources {
   // Equal to scattering_texture if COMBINED_SCATTERING_TEXTURES is defined.
   uint single_mie_scattering_texture;
   uint irradiance_texture;
+  // Equal to transmittance_texture if SPECTRAL_SUN_TRANSMITTANCE is not
+  // defined.
+  uint sun_transmittance_texture;
 };
 
 ConstantBuffer<DemoResources> resources : register(b1);
@@ -206,7 +213,14 @@ float3 GetSunAndSkyIrradiance(float3 position, float3 normal,
       ResourceDescriptorHeap[resources.transmittance_texture];
   Texture2D<float4> irradiance_texture =
       ResourceDescriptorHeap[resources.irradiance_texture];
-#ifdef USE_LUMINANCE
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+  Texture2D<float4> sun_transmittance_texture =
+      ResourceDescriptorHeap[resources.sun_transmittance_texture];
+  return GetSpectralSunAndSkyIlluminance(atmosphere,
+      sky_spectral_radiance_to_luminance, sun_spectral_radiance_to_luminance,
+      sun_transmittance_texture, irradiance_texture, lut_sampler, position,
+      normal, sun_direction, sky_irradiance);
+#elif defined(USE_LUMINANCE)
   return GetSunAndSkyIlluminance(atmosphere,
       sky_spectral_radiance_to_luminance, sun_spectral_radiance_to_luminance,
       transmittance_texture, irradiance_texture, lut_sampler, position, normal,
@@ -217,6 +231,15 @@ float3 GetSunAndSkyIrradiance(float3 position, float3 normal,
       sky_irradiance);
 #endif
 }
+
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+float3 GetSunTransmittance(float3 camera, float3 direction) {
+  Texture2D<float4> sun_transmittance_texture =
+      ResourceDescriptorHeap[resources.sun_transmittance_texture];
+  return GetSunTransmittance(atmosphere, sun_transmittance_texture,
+      lut_sampler, camera, direction);
+}
+#endif
 
 /*<h3>Shadows and light shafts</h3>
 
@@ -527,8 +550,13 @@ the scene:
       camera - earth_center, view_direction, shadow_length, sun_direction,
       transmittance);
 
-  // If the view ray intersects the Sun, add the Sun radiance.
+  // If the view ray intersects the Sun, add the Sun radiance (attenuated with
+  // the spectral sun transmittance, if available, which gives its exact color,
+  // instead of the transmittance of the view ray).
   if (dot(view_direction, sun_direction) > sun_size.y) {
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+    transmittance = GetSunTransmittance(camera - earth_center, view_direction);
+#endif
     radiance = radiance + transmittance * GetSolarRadiance();
   }
   radiance = lerp(radiance, ground_radiance, ground_alpha);

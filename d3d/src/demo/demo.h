@@ -116,6 +116,11 @@ struct AtmosphereSettings {
   // The wavelength integration rule in precomputed luminance mode (the
   // fitted rules use a fixed number of wavelengths, see Model).
   WavelengthRule wavelength_rule = WavelengthRule::kMidpoint;
+  // Whether to use the spectral sun transmittance option of the Model in
+  // precomputed luminance mode (exact colors for the Sun disc and the direct
+  // sunlight, band-averaged extinction coefficients for the aerial
+  // perspective).
+  bool spectral_sun_transmittance = false;
   int num_scattering_orders = 4;
 };
 
@@ -163,6 +168,11 @@ class Demo {
   void BuildPipelines();
   void ReloadShaders();
   void RenderLutView(ID3D12GraphicsCommandList* command_list);
+  // The textures which can be displayed in the LUT viewer, with their names,
+  // in a fixed order (lut_index_ is an index in this list). The optional
+  // textures which don't exist with the current model options are null.
+  std::vector<std::pair<const char*, const d3d12::Texture*>> GetLutTextures()
+      const;
   void SetView(double view_distance_meters, double view_zenith_angle_radians,
       double view_azimuth_angle_radians, double sun_zenith_angle_radians,
       double sun_azimuth_angle_radians, double exposure);

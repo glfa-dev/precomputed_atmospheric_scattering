@@ -65,7 +65,7 @@ GPU based validation).
 
 The demo window contains all the options of the OpenGL demo, which can also be
 changed with the same keyboard shortcuts, as well as some options specific to
-this port (`a`, `c` and `f` below):
+this port (`a`, `c`, `f` and `u` below):
 
 - mouse drag, CTRL + mouse drag, mouse wheel: view and Sun directions, distance,
 - `1`-`9`: predefined views, `+`/`-`: exposure,
@@ -81,6 +81,14 @@ this port (`a`, `c` and `f` below):
   wavelengths are optimized for the default atmosphere, and with very different
   spectra, e.g. much more ozone, a 30-60 wavelengths midpoint rule can be more
   accurate),
+- `u`: spectral sun transmittance in precomputed luminance mode (the Sun disc
+  and the direct sunlight are attenuated with a precomputed transmittance of
+  the solar spectrum, integrated over each sRGB channel, which gives their
+  exact colors, and the aerial perspective uses extinction coefficients
+  averaged over each sRGB channel, instead of their values at 680, 550 and
+  440nm; this fixes too red and too bright sunsets; with a large exposure, a
+  low Sun can show a white/yellow split along the contour where its blue
+  component becomes 0, an effect of the per channel tone mapping),
 - `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
   are averaged over the linear sRGB channels, weighted by the solar spectrum,
   instead of being sampled at 680, 550 and 440nm; radiance mode only),

@@ -164,6 +164,7 @@ class Demo {
   };
 
   void InitModel();
+  void LoadFilmLut(const std::filesystem::path& file);
   void UpdateWhitePoint();
   void BuildPipelines();
   void ReloadShaders();
@@ -193,6 +194,9 @@ class Demo {
   AtmosphereSettings settings_;
   Luminance use_luminance_;
   bool do_white_balance_;
+  // Whether to use the film emulation LUT instead of AgX for the tone mapping
+  // (only if film_lut_ could be loaded).
+  bool use_film_lut_;
   bool show_ui_;
   // Whether the model must be re-created (because settings_ changed), and
   // whether the Atmosphere window has unapplied changes.
@@ -211,6 +215,11 @@ class Demo {
   // extinction, absorption extinction and ground albedo, in R,G,B order).
   bool model_uses_rgb_coefficients_;
   std::array<std::array<double, 3>, 6> rgb_coefficients_;
+
+  // The film emulation LUT (empty if it could not be loaded, in which case
+  // film_lut_error_ contains the reason).
+  d3d12::Texture film_lut_;
+  std::string film_lut_error_;
 
   d3d12::ComPtr<ID3D12RootSignature> root_signature_;
   d3d12::ComPtr<ID3D12PipelineState> pipeline_state_;

@@ -28,6 +28,8 @@ it does not use any file outside of this directory.
   RHI: everything else uses raw D3D12 and d3dx12.
 - `src/demo/`, `shaders/demo/`: the demo application (port of
   `atmosphere/demo/`), with a Dear ImGui user interface.
+- `data/`: the film emulation 3D LUT used by the optional tone mapping of the
+  demo (see `data/README.md`).
 
 As in the rest of the project, the source files are written in a literate
 programming style: the block comments explain the code, and contain HTML.
@@ -55,8 +57,8 @@ Shaders are compiled at runtime with DXC. They are loaded from the source
 `shaders/` directory if it exists, and are recompiled automatically when they
 change (if an atmosphere shader changes, the precomputations are run again).
 Compilation errors are displayed in the application, which keeps using the
-previous shaders. A copy of the `shaders/` directory is also placed next to the
-executable, for when the source directory is not available.
+previous shaders. A copy of the `shaders/` and `data/` directories is also placed next to
+the executable, for when the source directory is not available.
 
 The debug build enables the D3D12 debug layer (`--gpu-validation` also enables
 GPU based validation).
@@ -65,7 +67,7 @@ GPU based validation).
 
 The demo window contains all the options of the OpenGL demo, which can also be
 changed with the same keyboard shortcuts, as well as some options specific to
-this port (`a`, `c`, `f` and `u` below):
+this port (`a`, `c`, `f`, `m` and `u` below):
 
 - mouse drag, CTRL + mouse drag, mouse wheel: view and Sun directions, distance,
 - `1`-`9`: predefined views, `+`/`-`: exposure,
@@ -90,6 +92,9 @@ this port (`a`, `c`, `f` and `u` below):
 - `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
   are averaged over the linear sRGB channels, weighted by the solar spectrum,
   instead of being sampled at 680, 550 and 440nm; radiance mode only),
+- `m`: tone mapping, AgX or a film emulation 3D LUT (`data/film_lut_65.bin`,
+  applied with a log2 shaper and a tetrahedral interpolation; it gives a more
+  saturated, "filmic" look; only available if the LUT file could be loaded),
 - `h`: show / hide the user interface, `v`: LUT viewer.
 
 The "Atmosphere" window can edit all the atmosphere model parameters ("Apply"
@@ -117,6 +122,7 @@ saves the last one and exits (D3D12 debug layer messages, if any, are written to
 - The demo uses the AgX tone mapping instead of the `1 - exp(-x)` curve of the
   OpenGL demo. Its implementation is a port of the one of the Godot Engine,
   under the MIT license (see the notice in `shaders/demo/demo.hlsl`).
+  Optionally, a film emulation 3D LUT can be used instead (key `m`).
 - Note: the precomputation of the scattering density is the most expensive
   dispatch (about 10 ms per scattering order on a recent GPU). On very slow GPUs,
   this dispatch could be split into several ones (e.g. one per 3D texture layer,

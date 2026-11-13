@@ -160,6 +160,21 @@ void Demo::DrawDemoWindow() {
     if (ImGui::Checkbox("White balance (w)", &do_white_balance_)) {
       UpdateWhitePoint();
     }
+    const char* kToneMappings[] = {"AgX", "Film LUT"};
+    int tone_mapping = use_film_lut_ ? 1 : 0;
+    ImGui::BeginDisabled(!film_lut_.resource());
+    if (ImGui::Combo("Tone mapping (m)", &tone_mapping, kToneMappings, 2)) {
+      use_film_lut_ = tone_mapping == 1;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      if (film_lut_.resource()) {
+        ImGui::SetTooltip(
+            "AgX, or a film emulation 3D LUT (data/film_lut_65.bin).");
+      } else {
+        ImGui::SetTooltip("Film LUT unavailable: %s", film_lut_error_.c_str());
+      }
+    }
+    ImGui::EndDisabled();
   }
 
   if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {

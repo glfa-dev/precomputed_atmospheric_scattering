@@ -58,7 +58,7 @@ descriptor heap indices provided in root constants:
 #define DEMO_ROOT_SIGNATURE \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)," \
     "CBV(b0)," \
-    "RootConstants(num32BitConstants=5, b1)," \
+    "RootConstants(num32BitConstants=7, b1)," \
     "StaticSampler(s0," \
     "    filter=FILTER_MIN_MAG_MIP_LINEAR," \
     "    addressU=TEXTURE_ADDRESS_CLAMP," \
@@ -109,6 +109,11 @@ struct DemoResources {
   // Equal to transmittance_texture if SPECTRAL_SUN_TRANSMITTANCE is not
   // defined.
   uint sun_transmittance_texture;
+  // The film emulation LUT of the optional tone mapping (see below), or any 3D
+  // texture if it is not available.
+  uint film_lut_texture;
+  // 0 for the AgX tone mapping, 1 for the film emulation LUT.
+  uint tone_mapping;
 };
 
 ConstantBuffer<DemoResources> resources : register(b1);
@@ -497,6 +502,96 @@ float3 LinearToSrgb(float3 color) {
       12.92 * color, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
 }
 
+/*
+<h3>Film emulation LUT</h3>
+
+<p>Optionally, AgX can be replaced with a more "aesthetic" tone mapping, defined
+by a 3D lookup table (LUT) baked from a film emulation model (see
+<code>data/README.md</code>). This LUT takes linear Rec.709 values (with middle
+gray at 0.18, as for AgX), and directly returns the final display values,
+already encoded with the sRGB transfer function. Its 65 samples per channel are
+not spaced linearly but logarithmically: the input values are first encoded
+with a "shaper" function, which covers 8 stops below and above middle gray in
+log2 space, extended below this range with a linear "toe" through the origin
+(tangent to the log2 curve, so that 0 maps to 0). The constants below must be
+the ones used to bake the LUT:
+*/
+
+static const float kFilmLutSize = 65.0;
+static const float kFilmLutMidGray = 0.18;
+static const float kFilmLutMinStops = -8.0;
+static const float kFilmLutMaxStops = 8.0;
+
+float3 FilmLutShaper(float3 color) {
+  const float kRange = kFilmLutMaxStops - kFilmLutMinStops;
+  // The toe ends 1/ln(2) stops above the minimum of the log2 range, where the
+  // tangent of the log2 curve passes through the origin.
+  const float kToeEnd =
+      kFilmLutMidGray * exp2(kFilmLutMinStops + 1.0 / log(2.0));
+  const float kToeSlope = 1.0 / (kToeEnd * log(2.0) * kRange);
+  // Negative values and NaNs are mapped to 0.
+  color = max(color, 0.0);
+  float3 log_code = (log2(max(color, kToeEnd)) -
+      (log2(kFilmLutMidGray) + kFilmLutMinStops)) / kRange;
+  return saturate(select(color < kToeEnd, color * kToeSlope, log_code));
+}
+
+/*
+<p>The LUT is sampled with a tetrahedral interpolation, instead of the
+trilinear interpolation of the texture sampler. For this, the LUT cell
+containing the shaped value is split into 6 tetrahedra which all share the main
+diagonal between the cell corners $c_{000}$ and $c_{111}$. With the fractional
+coordinates in the cell sorted as $f_{max}\ge f_{mid}\ge f_{min}$, the result
+is $(1-f_{max})c_{000}+(f_{max}-f_{mid})c_1+(f_{mid}-f_{min})c_2+f_{min}
+c_{111}$, where $c_1$ is the corner along the axis of $f_{max}$, and $c_2$ the
+corner along the axes of $f_{max}$ and $f_{mid}$. This needs only 4 texel
+loads, uses full precision weights, and the neutral colors (with equal
+fractional coordinates) only depend on the neutral samples of the LUT:
+*/
+
+float3 SampleFilmLut(Texture3D<float4> lut, float3 code) {
+  float3 p = saturate(code) * (kFilmLutSize - 1.0);
+  float3 base = min(floor(p), kFilmLutSize - 2.0);
+  float3 f = p - base;
+
+  bool x_ge_y = f.x >= f.y;
+  bool y_ge_z = f.y >= f.z;
+  bool x_ge_z = f.x >= f.z;
+  // Axis of the largest fraction (ties prefer x, then y).
+  int3 o1 = (x_ge_y && x_ge_z) ? int3(1, 0, 0) :
+      (y_ge_z ? int3(0, 1, 0) : int3(0, 0, 1));
+  // Axis of the smallest fraction (ties prefer z, then y), never equal to o1.
+  int3 o_min = (x_ge_z && y_ge_z) ? int3(0, 0, 1) :
+      (x_ge_y ? int3(0, 1, 0) : int3(1, 0, 0));
+  int3 o2 = int3(1, 1, 1) - o_min;
+
+  float f_max = max(f.x, max(f.y, f.z));
+  float f_min = min(f.x, min(f.y, f.z));
+  float f_mid = max(min(f.x, f.y), min(max(f.x, f.y), f.z));
+
+  int3 i0 = int3(base);
+  float3 c0 = lut.Load(int4(i0, 0)).rgb;
+  float3 c1 = lut.Load(int4(i0 + o1, 0)).rgb;
+  float3 c2 = lut.Load(int4(i0 + o2, 0)).rgb;
+  float3 c3 = lut.Load(int4(i0 + int3(1, 1, 1), 0)).rgb;
+  return c0 * (1.0 - f_max) + c1 * (f_max - f_mid) + c2 * (f_mid - f_min) +
+      c3 * f_min;
+}
+
+/*
+<p>Finally, the following function applies the selected tone mapping, and
+returns sRGB encoded display values:
+*/
+
+float3 ToneMap(float3 color) {
+  if (resources.tone_mapping != 0) {
+    Texture3D<float4> film_lut =
+        ResourceDescriptorHeap[resources.film_lut_texture];
+    return saturate(SampleFilmLut(film_lut, FilmLutShaper(color)));
+  }
+  return LinearToSrgb(AgxToneMap(color));
+}
+
 /*<h3>Main shading function</h3>
 
 <p>Using these functions we can now implement the main shader function, which
@@ -662,9 +757,8 @@ the scene:
   }
   radiance = lerp(radiance, ground_radiance, ground_alpha);
   radiance = lerp(radiance, sphere_radiance, sphere_alpha);
-  // With the default exposure, this gives about the same mean display
-  // luminance as the 1 - exp(-x) curve of the OpenGL demo (0.93 to 1.18 times
-  // over the predefined views), with more contrast.
-  return float4(LinearToSrgb(AgxToneMap(radiance / white_point * exposure)),
-      1.0);
+  // With the default exposure and the AgX tone mapping, this gives about the
+  // same mean display luminance as the 1 - exp(-x) curve of the OpenGL demo
+  // (0.93 to 1.18 times over the predefined views), with more contrast.
+  return float4(ToneMap(radiance / white_point * exposure), 1.0);
 }

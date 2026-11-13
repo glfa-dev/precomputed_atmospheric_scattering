@@ -47,6 +47,7 @@ textures used by the scene rendering shaders.
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <fstream>
 
 #include "atmosphere/constants.h"
 
@@ -108,9 +109,15 @@ struct DemoResources {
   uint32_t single_mie_scattering_texture;
   uint32_t irradiance_texture;
   uint32_t sun_transmittance_texture;
+  uint32_t film_lut_texture;
+  uint32_t tone_mapping;
 };
 // Must be equal to the number of root constants declared in demo.hlsl.
-static_assert(sizeof(DemoResources) == 5 * sizeof(uint32_t));
+static_assert(sizeof(DemoResources) == 7 * sizeof(uint32_t));
+
+// The size of the film emulation LUT (see data/README.md), which must be equal
+// to the kFilmLutSize constant in demo.hlsl.
+constexpr uint32_t kFilmLutSize = 65;
 
 // The root constants of the LUT viewer shader (see lut_view.hlsl).
 struct LutViewParameters {
@@ -132,8 +139,10 @@ constexpr DXGI_FORMAT kRenderTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 <p>The class constructor is straightforward and completely independent of our
 atmosphere model (which is initialized in the separate method
 <code>InitModel</code>). It creates a constant buffer for each frame in flight
-(persistently mapped in an upload heap), and the texture used to display the
-precomputed textures in the LUT viewer:
+(persistently mapped in an upload heap), the texture used to display the
+precomputed textures in the LUT viewer, and the film emulation LUT used by the
+optional tone mapping (loaded from the <code>data</code> directory next to the
+<code>shaders</code> one):
 */
 
 Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
@@ -146,6 +155,7 @@ Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
     num_frames_in_flight_(num_frames_in_flight),
     use_luminance_(NONE),
     do_white_balance_(false),
+    use_film_lut_(false),
     show_ui_(true),
     model_dirty_(false),
     settings_modified_(false),
@@ -182,6 +192,7 @@ Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
       SCATTERING_TEXTURE_HEIGHT, DXGI_FORMAT_R8G8B8A8_UNORM, true,
       L"LUT viewer texture");
 
+  LoadFilmLut(shader_directory.parent_path() / "data" / "film_lut_65.bin");
   InitModel();
 }
 
@@ -395,6 +406,74 @@ preprocessor macros corresponding to the model options:
     pipeline_state_.Reset();
     error_message_ = error.what();
   }
+}
+
+/*
+<p>The film emulation LUT is stored as raw 32 bits float RGBA texels, with the
+red input varying fastest, then the green one, which is directly the layout of
+a 3D texture whose x, y and z coordinates are the red, green and blue inputs.
+We upload it once and for all to such a texture, with the
+<code>UpdateSubresources</code> helper of d3dx12 (which takes care of the row
+pitch alignment in the intermediate upload buffer). If the file is missing or
+invalid, the film LUT tone mapping is simply disabled:
+*/
+
+void Demo::LoadFilmLut(const std::filesystem::path& file) {
+  constexpr size_t kRowSize = kFilmLutSize * 4 * sizeof(float);
+  constexpr size_t kSliceSize = kFilmLutSize * kRowSize;
+  constexpr size_t kFileSize = kFilmLutSize * kSliceSize;
+  std::vector<char> data(kFileSize);
+  {
+    std::ifstream input(file, std::ios::binary | std::ios::ate);
+    if (!input) {
+      film_lut_error_ = "Can't open " + file.string();
+      return;
+    }
+    if (static_cast<size_t>(input.tellg()) != kFileSize) {
+      film_lut_error_ = file.string() + " is not a " +
+          std::to_string(kFilmLutSize) + "^3 float32 RGBA LUT";
+      return;
+    }
+    input.seekg(0);
+    if (!input.read(data.data(), kFileSize)) {
+      film_lut_error_ = "Can't read " + file.string();
+      return;
+    }
+  }
+
+  ID3D12Device* d3d_device = device_->device();
+  d3d12::Texture texture = d3d12::Texture::Create3d(
+      d3d_device, descriptor_heap_, kFilmLutSize, kFilmLutSize, kFilmLutSize,
+      DXGI_FORMAT_R32G32B32A32_FLOAT, false, L"Film LUT");
+  d3d12::ComPtr<ID3D12Resource> upload_buffer;
+  CD3DX12_HEAP_PROPERTIES upload_heap(D3D12_HEAP_TYPE_UPLOAD);
+  auto buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(
+      GetRequiredIntermediateSize(texture.resource(), 0, 1));
+  D3D12_CHECK(d3d_device->CreateCommittedResource(
+      &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+      IID_PPV_ARGS(&upload_buffer)));
+
+  d3d12::ComPtr<ID3D12CommandAllocator> allocator;
+  d3d12::ComPtr<ID3D12GraphicsCommandList> command_list;
+  D3D12_CHECK(d3d_device->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+  D3D12_CHECK(d3d_device->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+      IID_PPV_ARGS(&command_list)));
+  command_list->SetName(L"Film LUT upload");
+  D3D12_SUBRESOURCE_DATA subresource = {};
+  subresource.pData = data.data();
+  subresource.RowPitch = static_cast<LONG_PTR>(kRowSize);
+  subresource.SlicePitch = static_cast<LONG_PTR>(kSliceSize);
+  d3d12::Transition(command_list.Get(),
+                    {{&texture, D3D12_RESOURCE_STATE_COPY_DEST}});
+  UpdateSubresources(command_list.Get(), texture.resource(),
+                     upload_buffer.Get(), 0, 0, 1, &subresource);
+  d3d12::Transition(command_list.Get(),
+                    {{&texture, d3d12::Texture::kShaderResourceState}});
+  device_->ExecuteAndWait(command_list.Get());
+  film_lut_ = std::move(texture);
 }
 
 /*
@@ -623,7 +702,12 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
                                   : model_->scattering_texture().srv(),
     model_->irradiance_texture().srv(),
     sun_transmittance_texture ? sun_transmittance_texture->srv()
-                              : model_->transmittance_texture().srv()
+                              : model_->transmittance_texture().srv(),
+    // Any 3D texture can be used if the film LUT is not available (it is not
+    // used in this case).
+    film_lut_.resource() ? film_lut_.srv()
+                         : model_->scattering_texture().srv(),
+    use_film_lut_ && film_lut_.resource() ? 1u : 0u
   };
 
   D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(width),
@@ -760,6 +844,11 @@ void Demo::HandleKey(char key) {
   } else if (key == 'w') {
     do_white_balance_ = !do_white_balance_;
     UpdateWhitePoint();
+  } else if (key == 'm') {
+    // The film LUT tone mapping is only available if the LUT could be loaded.
+    if (film_lut_.resource()) {
+      use_film_lut_ = !use_film_lut_;
+    }
   } else if (key == '+') {
     exposure_ *= 1.1;
   } else if (key == '-') {

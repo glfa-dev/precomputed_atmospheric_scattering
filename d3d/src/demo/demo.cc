@@ -148,6 +148,8 @@ Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
     settings_modified_(false),
     init_time_milliseconds_(0.0),
     white_point_{1.0f, 1.0f, 1.0f},
+    model_uses_rgb_coefficients_(false),
+    rgb_coefficients_{},
     constants_data_(nullptr),
     view_distance_meters_(9000.0),
     view_zenith_angle_radians_(1.47),
@@ -256,6 +258,88 @@ void Demo::InitModel() {
     ground_albedo.push_back(s.ground_albedo);
   }
 
+/*
+<p>By default the <code>Model</code> samples these wavelength dependent
+parameters at <code>kLambdaR</code>, <code>kLambdaG</code> and
+<code>kLambdaB</code> (680, 550 and 440nm) in radiance mode. This gives a
+greenish image (the solar spectrum is larger at 550nm than at 680nm, and the
+sRGB red channel is mostly sensitive around 600nm, not 680nm), and purplish
+twilights (680nm is in the weak tail of the ozone Chappuis absorption band,
+which peaks around 600nm). Optionally, we can instead replace each parameter
+$\beta(\lambda)$ with its average over each linear sRGB (i.e. Rec.709) channel
+$c$, weighted by the solar spectrum $S(\lambda)$ and by the sRGB color matching
+function $\bar{c}(\lambda)$:
+$$\beta_c=\frac{\int S(\lambda)\beta(\lambda)\bar{c}(\lambda)d\lambda}
+{\int S(\lambda)\bar{c}(\lambda)d\lambda}$$
+and the solar spectrum with its linear sRGB color $\int S\bar{c}d\lambda$
+(scaled by $10^{-5}$, like the luminance values in the luminance modes, so that
+the same exposure gives the same brightness in all modes). With these values, a single scattering
+event under a direct sunlight gives exactly the right sRGB color. But this is
+only an approximation for long optical paths, because the transmittance
+$\exp(-\int\beta)$ is not linear in $\beta$ (for instance, as the path length
+increases, the light which remains in each channel is concentrated at the
+wavelengths where the extinction is the smallest, which reduces the effective
+extinction coefficient of this channel). In practice, compared with the
+precomputed luminance mode, this removes the green tint of the default sampling
+in daylight and its purple tint at twilight, but gives slightly less red colors
+when the Sun is low, for the cost of a radiance precomputation. These RGB
+coefficients are passed to the
+<code>Model</code> as "spectra" sampled at exactly <code>kLambdaB</code>,
+<code>kLambdaG</code> and <code>kLambdaR</code>, so that the
+<code>Model</code> uses them unchanged:
+*/
+
+  std::vector<double> model_wavelengths = wavelengths;
+  std::vector<double> model_solar_irradiance = solar_irradiance;
+  std::array<std::vector<double>*, 5> coefficients = {
+      &rayleigh_scattering, &mie_scattering, &mie_extinction,
+      &absorption_extinction, &ground_albedo};
+  std::array<std::array<double, 3>, 6> rgb_coefficients = {};
+  if (s.use_rgb_coefficients) {
+    // Note: the RGB coefficients are only meaningful in radiance mode.
+    use_luminance_ = NONE;
+    auto to_srgb = [&wavelengths](const std::vector<double>& spectrum) {
+      std::array<double, 3> rgb;
+      Model::ConvertSpectrumToLinearSrgb(
+          wavelengths, spectrum, &rgb[0], &rgb[1], &rgb[2]);
+      return rgb;
+    };
+    const std::array<double, 3> solar_rgb = to_srgb(solar_irradiance);
+    // Same scale as the luminance modes, whose exposure is multiplied by 1e-5
+    // (see Render), so that the same exposure gives the same brightness.
+    constexpr double kLuminanceScale = 1e-5;
+    for (int c = 0; c < 3; ++c) {
+      rgb_coefficients[0][c] = solar_rgb[c] * kLuminanceScale;
+    }
+    for (size_t i = 0; i < coefficients.size(); ++i) {
+      std::vector<double> weighted(wavelengths.size());
+      for (size_t j = 0; j < wavelengths.size(); ++j) {
+        weighted[j] = solar_irradiance[j] * (*coefficients[i])[j];
+      }
+      const std::array<double, 3> weighted_rgb = to_srgb(weighted);
+      for (int c = 0; c < 3; ++c) {
+        // The signed sRGB color matching functions can yield slightly
+        // negative values (e.g. for the ozone absorption in the blue channel).
+        rgb_coefficients[i + 1][c] =
+            std::max(weighted_rgb[c] / solar_rgb[c], 0.0);
+      }
+    }
+    // The Model interpolates its input spectra at kLambdaR, kLambdaG and
+    // kLambdaB, and requires increasing wavelengths, hence the B,G,R order.
+    auto bgr = [](const std::array<double, 3>& rgb) {
+      return std::vector<double>{rgb[2], rgb[1], rgb[0]};
+    };
+    model_wavelengths = {Model::kLambdaB, Model::kLambdaG, Model::kLambdaR};
+    model_solar_irradiance = bgr(rgb_coefficients[0]);
+    for (size_t i = 0; i < coefficients.size(); ++i) {
+      *coefficients[i] = bgr(rgb_coefficients[i + 1]);
+    }
+  }
+
+/*
+<p>We can then create the <code>Model</code>:
+*/
+
   // The new model is first created and initialized separately, so that the
   // current one can be kept if this fails (e.g. because of a shader
   // compilation error).
@@ -263,8 +347,8 @@ void Demo::InitModel() {
   std::unique_ptr<Model> model;
   try {
     model = std::make_unique<Model>(device_, descriptor_heap_,
-        &shader_compiler_, wavelengths, solar_irradiance, s.sun_angular_radius,
-        s.bottom_radius, s.top_radius,
+        &shader_compiler_, model_wavelengths, model_solar_irradiance,
+        s.sun_angular_radius, s.bottom_radius, s.top_radius,
         std::vector<DensityProfileLayer>(s.rayleigh_density.begin(),
                                          s.rayleigh_density.end()),
         rayleigh_scattering,
@@ -285,6 +369,10 @@ void Demo::InitModel() {
   init_time_milliseconds_ = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - start).count();
   model_ = std::move(model);
+  model_uses_rgb_coefficients_ = s.use_rgb_coefficients;
+  rgb_coefficients_ = rgb_coefficients;
+  // The white point is computed from the full solar spectrum, even with RGB
+  // coefficients (whose solar irradiance is the sRGB color of this spectrum).
   wavelengths_ = std::move(wavelengths);
   solar_irradiance_ = std::move(solar_irradiance);
   UpdateWhitePoint();
@@ -602,7 +690,13 @@ void Demo::HandleKey(char key) {
     settings_.use_half_precision = !settings_.use_half_precision;
     settings_.max_sun_zenith_angle_degrees =
         settings_.use_half_precision ? 102.0 : 120.0;
+  } else if (key == 'c') {
+    settings_.use_rgb_coefficients = !settings_.use_rgb_coefficients;
   } else if (key == 'l') {
+    // Only the radiance mode is available with RGB coefficients.
+    if (model_uses_rgb_coefficients_) {
+      return;
+    }
     switch (use_luminance_) {
       case NONE: use_luminance_ = APPROXIMATE; break;
       case APPROXIMATE: use_luminance_ = PRECOMPUTED; break;
@@ -634,7 +728,8 @@ void Demo::HandleKey(char key) {
   } else if (key == '9') {
     SetView(1.2e7, 0.0, 0.0, 0.93, -2.0, 10.0);
   }
-  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'l') {
+  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'l' ||
+      key == 'c') {
     model_dirty_ = true;
   }
 }

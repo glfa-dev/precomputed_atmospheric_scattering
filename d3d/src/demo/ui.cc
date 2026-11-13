@@ -122,9 +122,14 @@ void Demo::DrawDemoWindow() {
     const char* kLuminanceModes[] = {"Off (radiance)", "Approximate",
                                      "Precomputed"};
     int luminance = static_cast<int>(use_luminance_);
+    ImGui::BeginDisabled(model_uses_rgb_coefficients_);
     if (ImGui::Combo("Luminance (l)", &luminance, kLuminanceModes, 3)) {
       use_luminance_ = static_cast<Luminance>(luminance);
       changed = true;
+    }
+    ImGui::EndDisabled();
+    if (model_uses_rgb_coefficients_) {
+      ImGui::TextDisabled("RGB coefficients: radiance mode only");
     }
     if (changed) {
       model_dirty_ = true;
@@ -213,6 +218,24 @@ void Demo::DrawAtmosphereWindow() {
     changed |= InputDouble("Solar irradiance (W/m2/nm)",
                            &s.constant_solar_irradiance, "%.3f");
     ImGui::EndDisabled();
+    changed |= ImGui::Checkbox("Rec.709 band-averaged coefficients (c)",
+                               &s.use_rgb_coefficients);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Average the spectral parameters over the linear sRGB channels\n"
+          "(weighted by the solar spectrum) instead of sampling them at\n"
+          "680, 550 and 440nm. Radiance mode only.");
+    }
+    if (model_uses_rgb_coefficients_) {
+      const char* kNames[] = {"Solar irradiance", "Rayleigh scattering",
+                              "Mie scattering", "Mie extinction",
+                              "Absorption extinction", "Ground albedo"};
+      for (int i = 0; i < 6; ++i) {
+        const std::array<double, 3>& rgb = rgb_coefficients_[i];
+        ImGui::TextDisabled("%-21s %.4g, %.4g, %.4g", kNames[i], rgb[0],
+                            rgb[1], rgb[2]);
+      }
+    }
   }
 
   if (ImGui::CollapsingHeader("Rayleigh")) {

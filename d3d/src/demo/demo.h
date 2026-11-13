@@ -70,6 +70,12 @@ struct AtmosphereSettings {
   // Wavelength independent solar irradiance "spectrum" (not physically
   // realistic, but was used in the original implementation), in W/m^2/nm.
   double constant_solar_irradiance = 1.5;
+  // Whether to replace the wavelength dependent parameters with their averages
+  // over the 3 linear sRGB (Rec.709) channels, weighted by the solar spectrum
+  // and the sRGB color matching functions, instead of sampling them at
+  // kLambdaR, kLambdaG, kLambdaB (see Demo::InitModel). Only compatible with
+  // the radiance (i.e. non luminance) rendering mode.
+  bool use_rgb_coefficients = false;
   double sun_angular_radius = 0.00935 / 2.0;
   double bottom_radius = 6360000.0;
   double top_radius = 6420000.0;
@@ -183,6 +189,11 @@ class Demo {
   std::vector<double> wavelengths_;
   std::vector<double> solar_irradiance_;
   float white_point_[3];
+  // Whether the current model uses RGB band-averaged coefficients, and their
+  // values (solar irradiance, Rayleigh scattering, Mie scattering, Mie
+  // extinction, absorption extinction and ground albedo, in R,G,B order).
+  bool model_uses_rgb_coefficients_;
+  std::array<std::array<double, 3>, 6> rgb_coefficients_;
 
   d3d12::ComPtr<ID3D12RootSignature> root_signature_;
   d3d12::ComPtr<ID3D12PipelineState> pipeline_state_;

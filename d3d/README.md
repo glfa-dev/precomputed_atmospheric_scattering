@@ -70,6 +70,9 @@ changed with the same keyboard shortcuts:
 - `1`-`9`: predefined views, `+`/`-`: exposure,
 - `s`: solar spectrum, `o`: ozone, `t`: combined textures, `p`: half precision,
   `l`: luminance mode, `w`: white balance,
+- `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
+  are averaged over the linear sRGB channels, weighted by the solar spectrum,
+  instead of being sampled at 680, 550 and 440nm; radiance mode only),
 - `h`: show / hide the user interface, `v`: LUT viewer.
 
 The "Atmosphere" window can edit all the atmosphere model parameters ("Apply"

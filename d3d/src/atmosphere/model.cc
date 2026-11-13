@@ -279,13 +279,15 @@ Model::Model(
     double length_unit_in_meters,
     unsigned int num_precomputed_wavelengths,
     bool combine_scattering_textures,
-    bool half_precision) :
+    bool half_precision,
+    bool accumulate_in_float32) :
         device_(device),
         descriptor_heap_(descriptor_heap),
         shader_compiler_(shader_compiler),
         num_precomputed_wavelengths_(num_precomputed_wavelengths),
         combine_scattering_textures_(combine_scattering_textures),
-        half_precision_(half_precision) {
+        half_precision_(half_precision),
+        accumulate_in_float32_(accumulate_in_float32) {
   // Note: the wavelengths are captured by value, because this lambda is used
   // by atmosphere_parameters_factory_, which can be called after the
   // constructor's arguments have been destroyed (at each Init call).
@@ -449,6 +451,8 @@ struct Model::Programs {
   d3d12::ComPtr<ID3D12PipelineState> compute_scattering_density;
   d3d12::ComPtr<ID3D12PipelineState> compute_indirect_irradiance;
   d3d12::ComPtr<ID3D12PipelineState> compute_multiple_scattering;
+  // Only used with the accumulate_in_float32 option (see below).
+  d3d12::ComPtr<ID3D12PipelineState> convert_to_half;
 };
 
 /*
@@ -471,6 +475,23 @@ struct Model::TemporaryTextures {
   d3d12::Texture& delta_multiple_scattering() {
     return delta_rayleigh_scattering;
   }
+  // With the accumulate_in_float32 option, the scattering orders (and the
+  // groups of 3 wavelengths) are accumulated in the following single precision
+  // textures (see Init), instead of directly in the final scattering_texture_
+  // and optional_single_mie_scattering_texture_.
+  bool accumulate_in_float32 = false;
+  d3d12::Texture float32_scattering;
+  d3d12::Texture float32_single_mie_scattering;
+  // The textures where the scattering orders are accumulated.
+  d3d12::Texture& scattering(Model& model) {
+    return accumulate_in_float32 ? float32_scattering
+                                 : model.scattering_texture_;
+  }
+  d3d12::Texture& single_mie_scattering(Model& model) {
+    return accumulate_in_float32
+        ? float32_single_mie_scattering
+        : model.optional_single_mie_scattering_texture_;
+  }
 };
 
 /*
@@ -487,7 +508,10 @@ wavelengths, and with an identity luminance_from_radiance matrix.</li>
 <code>num_precomputed_wavelengths</code> wavelengths, 3 at a time, each time
 converting the results to luminance (with the
 <code>luminance_from_radiance</code> matrix), and accumulating them in the
-final textures (via the <code>blend</code> argument).</li>
+final textures (via the <code>blend</code> argument) or, with the
+<code>accumulate_in_float32</code> option, in temporary single precision
+textures converted to the final half precision textures at the end (see
+below).</li>
 </ul>
 Since the atmosphere parameters and the luminance_from_radiance matrix are
 stored in a constant buffer, instead of being compiled in the shaders, each
@@ -496,6 +520,9 @@ group of 3 wavelengths simply uses a different part of an upload buffer:
 
 void Model::Init(unsigned int num_scattering_orders) {
   ID3D12Device* d3d_device = device_->device();
+  // The accumulate_in_float32 option is useless if the final textures already
+  // use single precision floats.
+  const bool accumulate_in_float32 = accumulate_in_float32_ && half_precision_;
 
   // Compile the shaders first, so that the precomputed textures are left
   // unchanged if this fails.
@@ -513,6 +540,10 @@ void Model::Init(unsigned int num_scattering_orders) {
     compile("ComputeIndirectIrradianceCS"),
     compile("ComputeMultipleScatteringCS"),
   };
+  d3d12::Shader convert_to_half_shader;
+  if (accumulate_in_float32) {
+    convert_to_half_shader = compile("ConvertToHalfCS");
+  }
 #ifndef NDEBUG
   // Check that the C++ and HLSL constant buffer layouts are the same.
   auto members = hlsl::GetAtmosphereParametersLayout("constants.atmosphere", 0);
@@ -532,12 +563,19 @@ void Model::Init(unsigned int num_scattering_orders) {
     &programs.compute_indirect_irradiance,
     &programs.compute_multiple_scattering,
   };
-  for (int i = 0; i < 6; ++i) {
+  auto create_pipeline_state = [&](const d3d12::Shader& shader,
+                                   d3d12::ComPtr<ID3D12PipelineState>* state) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = programs.root_signature.Get();
-    desc.CS = shaders[i].GetBytecode();
+    desc.CS = shader.GetBytecode();
     D3D12_CHECK(d3d_device->CreateComputePipelineState(
-        &desc, IID_PPV_ARGS(pipeline_states[i]->GetAddressOf())));
+        &desc, IID_PPV_ARGS(state->GetAddressOf())));
+  };
+  for (int i = 0; i < 6; ++i) {
+    create_pipeline_state(shaders[i], pipeline_states[i]);
+  }
+  if (accumulate_in_float32) {
+    create_pipeline_state(convert_to_half_shader, &programs.convert_to_half);
   }
 
   // Allocate the temporary textures.
@@ -559,6 +597,35 @@ void Model::Init(unsigned int num_scattering_orders) {
       d3d_device, descriptor_heap_, SCATTERING_TEXTURE_WIDTH,
       SCATTERING_TEXTURE_HEIGHT, SCATTERING_TEXTURE_DEPTH, format_3d, true,
       L"Delta scattering density texture");
+
+/*
+<p>The final scattering textures are the sum of the contributions of each
+scattering order and, in precomputed illuminance mode, of each group of 3
+wavelengths. With half precision textures, accumulating these contributions
+directly in the final textures rounds each partial sum to half precision. The
+rounding errors thus add up with the number of terms and, with many
+wavelengths, they give noticeable color errors. To avoid this, the
+<code>accumulate_in_float32</code> option accumulates these contributions in
+temporary single precision textures instead, converted only once to half
+precision at the end of the precomputations (the delta textures, which store a
+single contribution, still use the precision of the final textures). Otherwise,
+the contributions are directly accumulated in the final textures:
+*/
+
+  textures.accumulate_in_float32 = accumulate_in_float32;
+  if (accumulate_in_float32) {
+    textures.float32_scattering = d3d12::Texture::Create3d(
+        d3d_device, descriptor_heap_, SCATTERING_TEXTURE_WIDTH,
+        SCATTERING_TEXTURE_HEIGHT, SCATTERING_TEXTURE_DEPTH,
+        DXGI_FORMAT_R32G32B32A32_FLOAT, true, L"Float32 scattering texture");
+    if (!combine_scattering_textures_) {
+      textures.float32_single_mie_scattering = d3d12::Texture::Create3d(
+          d3d_device, descriptor_heap_, SCATTERING_TEXTURE_WIDTH,
+          SCATTERING_TEXTURE_HEIGHT, SCATTERING_TEXTURE_DEPTH,
+          DXGI_FORMAT_R32G32B32A32_FLOAT, true,
+          L"Float32 single Mie scattering texture");
+    }
+  }
 
   // Allocate an upload buffer for the constants of each group of 3 wavelengths
   // (plus one for the final transmittance pass in precomputed illuminance
@@ -600,7 +667,8 @@ void Model::Init(unsigned int num_scattering_orders) {
       IID_PPV_ARGS(&command_list)));
   command_list->SetName(L"Atmosphere precomputation");
   d3d12::GpuTimer timer(d3d_device, device_->queue(),
-                        num_iterations * 3 * num_scattering_orders + 1);
+      num_iterations * 3 * num_scattering_orders + 1 +
+          (accumulate_in_float32 ? 1 : 0));
 
   // The descriptor heap must be set before the root signature, since the root
   // signature uses the CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED flag.
@@ -665,6 +733,42 @@ void Model::Init(unsigned int num_scattering_orders) {
     command_list->SetComputeRoot32BitConstants(1, 12, &resources, 0);
     command_list->Dispatch(GroupCount(TRANSMITTANCE_TEXTURE_WIDTH),
                            GroupCount(TRANSMITTANCE_TEXTURE_HEIGHT), 1);
+    timer.End(command_list.Get());
+  }
+
+  // With the accumulate_in_float32 option, convert the accumulated results to
+  // the final half precision textures, with one dispatch per texture (i.e. one
+  // dispatch, or two with a separate single Mie scattering texture).
+  if (accumulate_in_float32) {
+    constexpr D3D12_RESOURCE_STATES kSrv = d3d12::Texture::kShaderResourceState;
+    constexpr D3D12_RESOURCE_STATES kUav =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    d3d12::Transition(command_list.Get(), {
+        {&textures.float32_scattering, kSrv},
+        {&scattering_texture_, kUav}});
+    if (!combine_scattering_textures_) {
+      d3d12::Transition(command_list.Get(), {
+          {&textures.float32_single_mie_scattering, kSrv},
+          {&optional_single_mie_scattering_texture_, kUav}});
+    }
+    auto convert = [&](const d3d12::Texture& input,
+                       const d3d12::Texture& output) {
+      PrecomputeResources resources = {};
+      resources.multiple_scattering_texture = input.srv();
+      resources.output0 = output.uav();
+      command_list->SetComputeRoot32BitConstants(
+          1, sizeof(resources) / 4, &resources, 0);
+      command_list->Dispatch(GroupCount(SCATTERING_TEXTURE_WIDTH),
+                             GroupCount(SCATTERING_TEXTURE_HEIGHT),
+                             SCATTERING_TEXTURE_DEPTH);
+    };
+    timer.Begin(command_list.Get(), "Convert to half");
+    command_list->SetPipelineState(programs.convert_to_half.Get());
+    convert(textures.float32_scattering, scattering_texture_);
+    if (!combine_scattering_textures_) {
+      convert(textures.float32_single_mie_scattering,
+              optional_single_mie_scattering_texture_);
+    }
     timer.End(command_list.Get());
   }
 
@@ -778,21 +882,25 @@ void Model::Precompute(
 
   // Compute the rayleigh and mie single scattering, store them in
   // delta_rayleigh_scattering_texture and delta_mie_scattering_texture, and
-  // either store them or accumulate them in scattering_texture_ and
-  // optional_single_mie_scattering_texture_.
+  // either store them or accumulate them in textures.scattering() and
+  // textures.single_mie_scattering() (i.e. in scattering_texture_ and
+  // optional_single_mie_scattering_texture_, or in their single precision
+  // temporary versions, see Init).
+  d3d12::Texture& scattering = textures.scattering(*this);
   d3d12::Transition(command_list, {
       {&textures.delta_rayleigh_scattering, kUav},
       {&textures.delta_mie_scattering, kUav},
-      {&scattering_texture_, kUav}});
+      {&scattering, kUav}});
   resources = {};
   resources.transmittance_texture = transmittance_texture_.srv();
   resources.output0 = textures.delta_rayleigh_scattering.uav();
   resources.output1 = textures.delta_mie_scattering.uav();
-  resources.output2 = scattering_texture_.uav();
+  resources.output2 = scattering.uav();
   if (!combine_scattering_textures_) {
-    d3d12::Transition(command_list,
-        {{&optional_single_mie_scattering_texture_, kUav}});
-    resources.output3 = optional_single_mie_scattering_texture_.uav();
+    d3d12::Texture& single_mie_scattering =
+        textures.single_mie_scattering(*this);
+    d3d12::Transition(command_list, {{&single_mie_scattering, kUav}});
+    resources.output3 = single_mie_scattering.uav();
   }
   resources.blend = blend ? 0b1100 : 0;
   dispatch("Single scattering", programs.compute_single_scattering.Get(),
@@ -845,7 +953,7 @@ void Model::Precompute(
 
     // Compute the multiple scattering, store it in
     // delta_multiple_scattering_texture, and accumulate it in
-    // scattering_texture_.
+    // textures.scattering().
     d3d12::Transition(command_list, {
         {&textures.delta_scattering_density, kSrv},
         {&textures.delta_multiple_scattering(), kUav}});
@@ -854,7 +962,7 @@ void Model::Precompute(
     resources.scattering_density_texture =
         textures.delta_scattering_density.srv();
     resources.output0 = textures.delta_multiple_scattering().uav();
-    resources.output1 = scattering_texture_.uav();
+    resources.output1 = scattering.uav();
     resources.blend = 0b10;
     dispatch("Multiple scattering", programs.compute_multiple_scattering.Get(),
              resources, SCATTERING_TEXTURE_WIDTH, SCATTERING_TEXTURE_HEIGHT,

@@ -280,7 +280,7 @@ void ComputeIndirectIrradianceCS(uint3 texel : SV_DispatchThreadID) {
 }
 
 /*
-<p>Finally, the multiple scattering shader computes the multiple scattering for
+<p>The multiple scattering shader computes the multiple scattering for
 the current scattering order, from the scattering density computed above, stores
 it in the delta multiple scattering texture, and accumulates it, converted to
 luminance and divided by the Rayleigh phase function, in the scattering texture
@@ -311,4 +311,28 @@ void ComputeMultipleScatteringCS(uint3 texel : SV_DispatchThreadID) {
       mul(constants.luminance_from_radiance, multiple_scattering) /
           RayleighPhaseFunction(nu),
       0.0));
+}
+
+/*
+<p>With the <code>accumulate_in_float32</code> option, the scattering orders
+(and the groups of 3 wavelengths) are accumulated in temporary single precision
+textures, instead of directly in the final half precision textures (see
+<code>Model::Init</code>), to avoid the accumulation of rounding errors. The
+following shader then converts these sums to half precision, once, by
+copying a single precision texture (whose shader resource view index is
+provided in the <code>multiple_scattering_texture</code> root constant) into
+the final half precision texture (<code>output0</code>):
+*/
+
+[RootSignature(PRECOMPUTE_ROOT_SIGNATURE)]
+[numthreads(8, 8, 1)]
+void ConvertToHalfCS(uint3 texel : SV_DispatchThreadID) {
+  if (any(texel >= uint3(SCATTERING_TEXTURE_WIDTH, SCATTERING_TEXTURE_HEIGHT,
+                         SCATTERING_TEXTURE_DEPTH))) {
+    return;
+  }
+  Texture3D<float4> input =
+      ResourceDescriptorHeap[resources.multiple_scattering_texture];
+  RWTexture3D<float4> output = ResourceDescriptorHeap[resources.output0];
+  output[texel] = input[texel];
 }

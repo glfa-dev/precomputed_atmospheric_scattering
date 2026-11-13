@@ -413,7 +413,19 @@ class Model {
     // Whether to use half precision floats (16 bits) or single precision floats
     // (32 bits) for the precomputed textures. Half precision is sufficient for
     // most cases, except for very high exposure values.
-    bool half_precision);
+    bool half_precision,
+    // Whether to accumulate the precomputation results in temporary single
+    // precision textures, converted once to the final half precision textures
+    // at the end of Init, instead of directly in these final textures (this
+    // option has no effect if half_precision is false). In precomputed
+    // illuminance mode, the scattering textures are the sum of
+    // num_scattering_orders contributions for each group of 3 wavelengths, and
+    // each partial sum is rounded to half precision if accumulated directly in
+    // the final textures. With many wavelengths, this gives noticeable color
+    // errors, that this option avoids (at the cost of more temporary GPU memory
+    // during Init). It is also applied in precomputed irradiance mode, where it
+    // only avoids the (smaller) rounding errors of the scattering orders sum.
+    bool accumulate_in_float32 = false);
 
   ~Model();
 
@@ -510,6 +522,7 @@ class Model {
   unsigned int num_precomputed_wavelengths_;
   bool combine_scattering_textures_;
   bool half_precision_;
+  bool accumulate_in_float32_;
   std::function<hlsl::AtmosphereParameters(const vec3&)>
       atmosphere_parameters_factory_;
   hlsl::AtmosphereParameters atmosphere_parameters_;

@@ -119,6 +119,16 @@ void Demo::DrawDemoWindow() {
           settings_.use_half_precision ? 102.0 : 120.0;
       changed = true;
     }
+    ImGui::BeginDisabled(!settings_.use_half_precision);
+    changed |= ImGui::Checkbox("32-bit accumulation (a)",
+                               &settings_.accumulate_in_float32);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip(
+          "Accumulate the precomputation passes in 32-bit floats before\n"
+          "converting the results to half precision. Mostly useful in\n"
+          "precomputed luminance mode, with many wavelengths.");
+    }
+    ImGui::EndDisabled();
     const char* kLuminanceModes[] = {"Off (radiance)", "Approximate",
                                      "Precomputed"};
     int luminance = static_cast<int>(use_luminance_);

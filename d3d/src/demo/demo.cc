@@ -360,7 +360,8 @@ coefficients are passed to the
         absorption_extinction, ground_albedo,
         s.max_sun_zenith_angle_degrees / 180.0 * kPi, kLengthUnitInMeters,
         use_luminance_ == PRECOMPUTED ? s.num_precomputed_wavelengths : 3,
-        s.use_combined_textures, s.use_half_precision);
+        s.use_combined_textures, s.use_half_precision,
+        s.accumulate_in_float32);
     model->Init(s.num_scattering_orders);
   } catch (const std::exception& error) {
     error_message_ = error.what();
@@ -690,6 +691,12 @@ void Demo::HandleKey(char key) {
     settings_.use_half_precision = !settings_.use_half_precision;
     settings_.max_sun_zenith_angle_degrees =
         settings_.use_half_precision ? 102.0 : 120.0;
+  } else if (key == 'a') {
+    // 32-bit accumulation is only available with half precision.
+    if (!settings_.use_half_precision) {
+      return;
+    }
+    settings_.accumulate_in_float32 = !settings_.accumulate_in_float32;
   } else if (key == 'c') {
     settings_.use_rgb_coefficients = !settings_.use_rgb_coefficients;
   } else if (key == 'l') {
@@ -728,8 +735,8 @@ void Demo::HandleKey(char key) {
   } else if (key == '9') {
     SetView(1.2e7, 0.0, 0.0, 0.93, -2.0, 10.0);
   }
-  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'l' ||
-      key == 'c') {
+  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'a' ||
+      key == 'l' || key == 'c') {
     model_dirty_ = true;
   }
 }

@@ -69,7 +69,10 @@ changed with the same keyboard shortcuts:
 - mouse drag, CTRL + mouse drag, mouse wheel: view and Sun directions, distance,
 - `1`-`9`: predefined views, `+`/`-`: exposure,
 - `s`: solar spectrum, `o`: ozone, `t`: combined textures, `p`: half precision,
-  `l`: luminance mode, `w`: white balance,
+  `a`: 32-bit accumulation (the precomputations are accumulated in 32-bit
+  floats, and converted once to half precision at the end; only with half
+  precision, mostly useful in precomputed luminance mode with many
+  wavelengths), `l`: luminance mode, `w`: white balance,
 - `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
   are averaged over the linear sRGB channels, weighted by the solar spectrum,
   instead of being sampled at 680, 550 and 440nm; radiance mode only),

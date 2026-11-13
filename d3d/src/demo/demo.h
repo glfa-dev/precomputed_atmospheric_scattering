@@ -107,6 +107,9 @@ struct AtmosphereSettings {
   double max_sun_zenith_angle_degrees = 102.0;
   bool use_combined_textures = true;
   bool use_half_precision = true;
+  // Whether to accumulate the precomputations in single precision textures,
+  // converted to half precision at the end (only with half precision).
+  bool accumulate_in_float32 = false;
   // The number of wavelengths in precomputed luminance mode.
   int num_precomputed_wavelengths = 15;
   int num_scattering_orders = 4;

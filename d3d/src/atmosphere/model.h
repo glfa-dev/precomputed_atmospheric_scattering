@@ -181,7 +181,8 @@ parameter):
   <a href="http://www.oskee.wz.cz/stranka/uploads/SCCG10ElekKmoch.pdf">Real-time
   Spectral Scattering in Large-scale Natural Participating Media</a>, section
   4.4 (i.e. <code>num_precomputed_wavelengths</code> irradiance values are
-  precomputed, and then converted to sRGB via a numerical integration of this
+  precomputed - or 6 or 9 values with a fitted <code>WavelengthRule</code>, see
+  below - and then converted to sRGB via a numerical integration of this
   spectrum with the CIE color matching functions). The API functions returning
   luminance values return these precomputed values (times the phase functions),
   while <i>the API functions returning radiance values are not provided</i>
@@ -298,6 +299,31 @@ class DensityProfileLayer {
 };
 
 /*
+<p>In precomputed illuminance mode (see above), the precomputed sRGB values are
+a numerical integral, over the wavelength, of the spectral results at a few
+wavelengths. This D3D12 port adds an option to choose the integration rule (the
+OpenGL version only provides the first one):
+*/
+
+enum class WavelengthRule {
+  // num_precomputed_wavelengths (rounded up to a multiple of 3) wavelengths,
+  // evenly spaced between 360 and 830nm, each weighted by the sRGB color
+  // matching functions at this wavelength times the wavelength spacing (as in
+  // the OpenGL version).
+  kMidpoint,
+  // 6 (resp. 9) wavelengths at fixed positions, optimized offline, with
+  // weights fitted at construction time to the model's own input spectra
+  // (see model.cc). With 2 (resp. 3) precomputations of 3 wavelengths, this
+  // gives colors close to converged ones for Earth-like atmospheres, much
+  // closer than the default 15 wavelengths midpoint rule (5 precomputations).
+  // The positions were optimized for the default Earth atmosphere: with very
+  // different spectra (e.g. a much larger amount of ozone), a midpoint rule
+  // with many wavelengths (30-60) can be more accurate.
+  kFitted6,
+  kFitted9
+};
+
+/*
 <p>The <code>Model</code> constructor takes the same atmosphere parameters as
 in the OpenGL version, plus the Direct3D objects needed to create the
 precomputed textures, and to compile the precomputation shaders:
@@ -404,7 +430,9 @@ class Model {
     // - otherwise, scattering is precomputed for this number of wavelengths
     // (rounded up to a multiple of 3), integrated with the CIE color matching
     // functions, and stored as illuminance values. Then only the
-    // luminance-based API functions are provided (see the above note).
+    // luminance-based API functions are provided (see the above note). The
+    // wavelengths and the integration weights depend on wavelength_rule (with
+    // a fitted rule, this number is only used to select this mode).
     unsigned int num_precomputed_wavelengths,
     // Whether to pack the (red component of the) single Mie scattering with the
     // Rayleigh and multiple scattering in a single texture, or to store the
@@ -425,7 +453,15 @@ class Model {
     // errors, that this option avoids (at the cost of more temporary GPU memory
     // during Init). It is also applied in precomputed irradiance mode, where it
     // only avoids the (smaller) rounding errors of the scattering orders sum.
-    bool accumulate_in_float32 = false);
+    bool accumulate_in_float32 = false,
+    // The wavelengths and weights used to integrate the spectral results into
+    // illuminance values, in precomputed illuminance mode (ignored otherwise).
+    // For Earth-like atmospheres, the fitted rules give more accurate colors
+    // than the midpoint rule, with fewer wavelengths, i.e. a smaller
+    // precomputation time (best used with accumulate_in_float32, since their
+    // weights are larger and of both signs). If their weights can't be fitted
+    // (e.g. with a null solar spectrum), the midpoint rule is used instead.
+    WavelengthRule wavelength_rule = WavelengthRule::kMidpoint);
 
   ~Model();
 
@@ -506,6 +542,12 @@ class Model {
   typedef std::array<float, 9> mat3;
   struct Programs;
   struct TemporaryTextures;
+  // The 3 wavelengths of a precomputation pass, and the matrix converting the
+  // spectral results at these wavelengths to (partial) luminance values.
+  struct WavelengthPass {
+    vec3 lambdas;
+    mat3 luminance_from_radiance;
+  };
 
   void Precompute(
       ID3D12GraphicsCommandList* command_list,
@@ -523,6 +565,9 @@ class Model {
   bool combine_scattering_textures_;
   bool half_precision_;
   bool accumulate_in_float32_;
+  // The precomputation passes in precomputed illuminance mode (computed in
+  // the constructor; empty in precomputed irradiance mode).
+  std::vector<WavelengthPass> wavelength_passes_;
   std::function<hlsl::AtmosphereParameters(const vec3&)>
       atmosphere_parameters_factory_;
   hlsl::AtmosphereParameters atmosphere_parameters_;

@@ -45,6 +45,7 @@ This is the role of the following C++ code.
 
 #include "atmosphere/model.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -157,6 +158,287 @@ void ComputeSpectralRadianceToLuminanceFactors(
   *k_r *= MAX_LUMINOUS_EFFICACY * dlambda;
   *k_g *= MAX_LUMINOUS_EFFICACY * dlambda;
   *k_b *= MAX_LUMINOUS_EFFICACY * dlambda;
+}
+
+/*
+<p>In precomputed illuminance mode, the precomputed textures contain, for each
+linear sRGB channel $c$, the integral $\int L(\lambda)\bar{c}(\lambda)d\lambda$
+of the spectral radiance $L$ times the sRGB color matching function $\bar{c}$
+(i.e. <code>XYZ_TO_SRGB</code> times the CIE color matching functions, without
+the <code>MAX_LUMINOUS_EFFICACY</code> factor, see the
+<a href="#implementation">Model constructor</a>). This
+integral is approximated with a weighted sum $\sum_i w_{c,i}L(\lambda_i)$ of
+the spectral radiance at a few wavelengths $\lambda_i$, each requiring a
+precomputation (3 wavelengths per precomputation pass). The OpenGL version uses
+the midpoint rule, i.e. evenly spaced $\lambda_i$ between 360 and 830nm, and
+$w_{c,i}=\bar{c}(\lambda_i)\Delta\lambda$. This rule needs many wavelengths to
+get accurate colors: the color matching functions have narrow peaks, and it
+uses no information about the possible radiance spectra.
+
+<p>But these spectra are not arbitrary: they are the solar spectrum, filtered
+by the transmittance of the atmosphere along some paths, and by some scattering
+events, with spectral variations entirely determined by the
+<code>Model</code>'s input spectra. This can be used to get a much better
+integration rule: for given wavelengths $\lambda_i$, we choose the weights
+$w_{c,i}$ minimizing the integration error over a family of such "training"
+spectra $f$, i.e. $\sum_f(\sum_i w_{c,i}f(\lambda_i)-\int
+f\bar{c}d\lambda)^2$. This is a linear least squares problem, whose solution
+depends on the input spectra (in particular, weights fitted for a given solar
+spectrum give large errors with another one). Thus, we fit these weights here,
+at construction time. The wavelengths themselves, on the other hand, were
+optimized offline (by minimizing the residual error of this fit with a global
+optimizer, for the default Earth atmosphere), and are fixed:
+*/
+
+constexpr double kFitted6Wavelengths[6] = {
+  413.8688135933362, 447.3719319909487, 482.9039304243995,
+  537.0640314119139, 592.8834954527024, 644.0572502549226
+};
+constexpr double kFitted9Wavelengths[9] = {
+  412.37622700242605, 444.1180920345416, 458.2532482631017,
+  491.25498775791857, 528.1929811255243, 570.3219845576455,
+  578.5619239716891, 613.0124906093698, 660.2580585325449
+};
+
+/*
+<p>The training spectra are of the form
+$$f(\lambda)=S(\lambda)\left(\frac{\beta_R(\lambda)}{\beta_R(550)}\right)^a
+\exp\left(-m_R V_R\beta_R(\lambda)-m_M m_R V_M\beta_M^{ext}(\lambda)-
+m_O V_O\beta_O^{ext}(\lambda)\right)$$
+where $S$ is the solar irradiance, $\beta_R$ the Rayleigh scattering
+coefficient, $\beta_M^{ext}$ the Mie extinction coefficient, $\beta_O^{ext}$
+the absorption extinction coefficient, and $V_R,V_M,V_O$ the vertical column
+integrals of the corresponding density profiles (from the bottom to the top of
+the atmosphere). In other words, these are solar spectra transmitted through
+$m_R$ vertical air masses of molecules (from 0, i.e. no attenuation, to 38,
+i.e. a horizontal path), with $m_M\in\{0,1,2.5\}$ times as many aerosols,
+and $m_O$ vertical columns of ozone (up to 20, for long twilight paths through
+the ozone layer), and "blued" by $a\in\{0,1,2,3\}$ Rayleigh scattering events
+(0 for direct sunlight, 1 for single scattering, etc). They don't depend on the
+view and sun directions, and are built only from the <code>Model</code> inputs.
+
+<p>We first need the vertical column integrals of the density profiles, which
+we compute with the trapezoidal rule, using the same layer selection and
+clamping as the <code>GetProfileDensity</code> shader function (in <a href=
+"../../shaders/atmosphere/functions.hlsli.html">functions.hlsli</a>):
+*/
+
+// Returns the integral of the given density profile between the bottom and the
+// top of the atmosphere, in m.
+double ComputeVerticalColumn(std::vector<DensityProfileLayer> layers,
+                             double bottom_radius, double top_radius) {
+  // Same padding as in the Model constructor: missing layers are added at the
+  // bottom, and only the first 2 layers are used.
+  while (layers.size() < 2) {
+    layers.insert(layers.begin(), DensityProfileLayer());
+  }
+  auto density = [&layers](double altitude) {
+    const DensityProfileLayer& layer =
+        altitude < layers[0].width ? layers[0] : layers[1];
+    double value = layer.exp_term * exp(layer.exp_scale * altitude) +
+        layer.linear_term * altitude + layer.constant_term;
+    return std::clamp(value, 0.0, 1.0);
+  };
+  constexpr int kSampleCount = 10000;
+  const double dh = (top_radius - bottom_radius) / kSampleCount;
+  double result = 0.0;
+  for (int i = 0; i <= kSampleCount; ++i) {
+    double weight = i == 0 || i == kSampleCount ? 0.5 : 1.0;
+    result += density(i * dh) * weight * dh;
+  }
+  return result;
+}
+
+/*
+<p>The weights are then fitted as follows. Each training spectrum $f$ is
+tabulated with a 1nm step between 360 and 829nm (by linear interpolation of
+the input spectra), which gives its exact integral with the sRGB color matching
+functions (with the same 1nm step as in
+<code>ConvertSpectrumToLinearSrgb</code>), and its values at the $\lambda_i$
+(by linear interpolation of this 1nm table). Each spectrum is normalized by its
+luminance $Y$ (computed from its exact linear sRGB value), so that the fit
+minimizes relative errors, which are those that are visible after exposure
+adjustment, and the spectra with a negligible luminance (e.g. through 38 air
+masses and 20 ozone columns) are dropped. Finally, to avoid ill-conditioned
+solutions with very large weights of opposite signs, we add a small ridge
+regularization term $\epsilon\Vert w_c\Vert^2$ to the least squares error, and
+we solve the corresponding normal equations with a Cholesky decomposition:
+*/
+
+// The signed linear sRGB color matching function for the given channel,
+// without the MAX_LUMINOUS_EFFICACY factor.
+double SrgbColorMatchingFunction(double wavelength, int component) {
+  double x = CieColorMatchingFunctionTableValue(wavelength, 1);
+  double y = CieColorMatchingFunctionTableValue(wavelength, 2);
+  double z = CieColorMatchingFunctionTableValue(wavelength, 3);
+  return XYZ_TO_SRGB[component * 3] * x + XYZ_TO_SRGB[component * 3 + 1] * y +
+      XYZ_TO_SRGB[component * 3 + 2] * z;
+}
+
+// Solves the symmetric positive definite n x n system 'a' x = 'b' (row major
+// matrix), with a Cholesky decomposition (computed in place in the local copy
+// of 'a').
+std::vector<double> SolveCholesky(std::vector<double> a,
+                                  const std::vector<double>& b) {
+  const size_t n = b.size();
+  for (size_t j = 0; j < n; ++j) {
+    for (size_t k = 0; k < j; ++k) {
+      a[j * n + j] -= a[j * n + k] * a[j * n + k];
+    }
+    // The ridge term makes the matrix positive definite, so this floor is
+    // only a guard against a division by zero (e.g. with NaN inputs).
+    a[j * n + j] = sqrt(std::max(a[j * n + j], 1e-300));
+    for (size_t i = j + 1; i < n; ++i) {
+      for (size_t k = 0; k < j; ++k) {
+        a[i * n + j] -= a[i * n + k] * a[j * n + k];
+      }
+      a[i * n + j] /= a[j * n + j];
+    }
+  }
+  // Forward substitution (L y = b), then back substitution (L^T x = y).
+  std::vector<double> x = b;
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t k = 0; k < i; ++k) {
+      x[i] -= a[i * n + k] * x[k];
+    }
+    x[i] /= a[i * n + i];
+  }
+  for (size_t i = n; i-- > 0;) {
+    for (size_t k = i + 1; k < n; ++k) {
+      x[i] -= a[k * n + i] * x[k];
+    }
+    x[i] /= a[i * n + i];
+  }
+  return x;
+}
+
+// Returns the weights w[i][c] of the wavelengths 'nodes' for the linear sRGB
+// channel c, in the same unit as the luminance_from_radiance coefficients of
+// the midpoint rule (see the Model constructor). The other arguments are the
+// Model inputs (in m^-1 for the scattering and extinction coefficients) and
+// the vertical column integrals of the Rayleigh, Mie and absorption density
+// profiles (in m). Returns an empty vector if the weights can't be fitted.
+std::vector<std::array<double, 3>> FitWavelengthRuleWeights(
+    const std::vector<double>& nodes,
+    const std::vector<double>& wavelengths,
+    const std::vector<double>& solar_irradiance,
+    const std::vector<double>& rayleigh_scattering,
+    const std::vector<double>& mie_extinction,
+    const std::vector<double>& absorption_extinction,
+    double rayleigh_column, double mie_column, double absorption_column) {
+  // The input spectra and the sRGB color matching functions, tabulated with a
+  // 1nm step from kLambdaMin to kLambdaMax - 1.
+  constexpr int kSize = kLambdaMax - kLambdaMin;
+  std::vector<double> solar(kSize), rayleigh(kSize), mie(kSize),
+      absorption(kSize);
+  std::vector<std::array<double, 3>> cmf(kSize);
+  for (int j = 0; j < kSize; ++j) {
+    double lambda = kLambdaMin + j;
+    solar[j] = Interpolate(wavelengths, solar_irradiance, lambda);
+    rayleigh[j] = Interpolate(wavelengths, rayleigh_scattering, lambda);
+    mie[j] = Interpolate(wavelengths, mie_extinction, lambda);
+    absorption[j] = Interpolate(wavelengths, absorption_extinction, lambda);
+    for (int c = 0; c < 3; ++c) {
+      cmf[j][c] = SrgbColorMatchingFunction(lambda, c);
+    }
+  }
+  const double rayleigh_550 = rayleigh[550 - kLambdaMin];
+
+  // The 1nm table indices and interpolation factors for each node.
+  const size_t n = nodes.size();
+  std::vector<int> node_index(n);
+  std::vector<double> node_u(n);
+  for (size_t i = 0; i < n; ++i) {
+    double x = std::clamp(nodes[i], double(kLambdaMin), kLambdaMax - 1.0) -
+        kLambdaMin;
+    node_index[i] = std::min(static_cast<int>(std::floor(x)), kSize - 2);
+    node_u[i] = x - node_index[i];
+  }
+
+  // The training spectra values at the nodes, their linear sRGB values (the
+  // fit targets), and their luminance.
+  struct Sample {
+    std::vector<double> values;
+    std::array<double, 3> rgb;
+    double luminance;
+  };
+  std::vector<Sample> samples;
+  std::vector<double> f(kSize);
+  for (int a = 0; a <= 3; ++a) {
+    for (double m_r : {0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 38.0}) {
+      for (double m_m : {0.0, 1.0, 2.5}) {
+        for (double m_o : {0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0}) {
+          Sample sample = {std::vector<double>(n), {0.0, 0.0, 0.0}, 0.0};
+          for (int j = 0; j < kSize; ++j) {
+            double ratio =
+                rayleigh_550 > 0.0 ? rayleigh[j] / rayleigh_550 : 1.0;
+            double optical_depth = m_r * rayleigh_column * rayleigh[j] +
+                m_m * m_r * mie_column * mie[j] +
+                m_o * absorption_column * absorption[j];
+            f[j] = solar[j] * pow(ratio, a) * exp(-optical_depth);
+            for (int c = 0; c < 3; ++c) {
+              sample.rgb[c] += cmf[j][c] * f[j];
+            }
+          }
+          for (size_t i = 0; i < n; ++i) {
+            int j = node_index[i];
+            sample.values[i] =
+                f[j] * (1.0 - node_u[i]) + f[j + 1] * node_u[i];
+          }
+          sample.luminance = 0.2126 * sample.rgb[0] +
+              0.7152 * sample.rgb[1] + 0.0722 * sample.rgb[2];
+          samples.push_back(std::move(sample));
+        }
+      }
+    }
+  }
+  double max_luminance = 0.0;
+  for (const Sample& sample : samples) {
+    max_luminance = std::max(max_luminance, sample.luminance);
+  }
+
+  // The normal equations of the regularized least squares problem, with the
+  // spectra normalized by their luminance: (A + epsilon I) w_c = b_c, with
+  // A = sum_f v v^T and b_c = sum_f v rgb_c, where v are the values at the
+  // nodes. As in the offline optimization of the nodes, epsilon is 1e-7 times
+  // the average diagonal element of A.
+  std::vector<double> normal_matrix(n * n, 0.0);
+  std::vector<std::vector<double>> rhs(3, std::vector<double>(n, 0.0));
+  for (const Sample& sample : samples) {
+    if (!(sample.luminance > 1e-6 * max_luminance)) {
+      continue;
+    }
+    const double scale = 1.0 / sample.luminance;
+    for (size_t i = 0; i < n; ++i) {
+      double v_i = sample.values[i] * scale;
+      for (size_t k = 0; k < n; ++k) {
+        normal_matrix[i * n + k] += v_i * sample.values[k] * scale;
+      }
+      for (int c = 0; c < 3; ++c) {
+        rhs[c][i] += v_i * sample.rgb[c] * scale;
+      }
+    }
+  }
+  double trace = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    trace += normal_matrix[i * n + i];
+  }
+  if (!(trace > 0.0)) {
+    // Degenerate case (e.g. a null or negative solar spectrum): no weights
+    // can be fitted, and the caller falls back to the midpoint rule.
+    return {};
+  }
+  std::vector<std::array<double, 3>> weights(n, {0.0, 0.0, 0.0});
+  for (size_t i = 0; i < n; ++i) {
+    normal_matrix[i * n + i] += 1e-7 * trace / n;
+  }
+  for (int c = 0; c < 3; ++c) {
+    std::vector<double> w = SolveCholesky(normal_matrix, rhs[c]);
+    for (size_t i = 0; i < n; ++i) {
+      weights[i][c] = w[i];
+    }
+  }
+  return weights;
 }
 
 /*
@@ -280,7 +562,8 @@ Model::Model(
     unsigned int num_precomputed_wavelengths,
     bool combine_scattering_textures,
     bool half_precision,
-    bool accumulate_in_float32) :
+    bool accumulate_in_float32,
+    WavelengthRule wavelength_rule) :
         device_(device),
         descriptor_heap_(descriptor_heap),
         shader_compiler_(shader_compiler),
@@ -372,6 +655,77 @@ Model::Model(
   };
   atmosphere_parameters_ =
       atmosphere_parameters_factory_({kLambdaR, kLambdaG, kLambdaB});
+
+/*
+<p>In precomputed illuminance mode, the constructor also computes the
+wavelengths of each precomputation pass, and the corresponding
+<code>luminance_from_radiance</code> matrices, from the wavelength integration
+rule (see the <a href="#utilities">utility functions</a>). With a fitted rule,
+the matrix coefficients are the weights fitted for the input spectra. With the
+midpoint rule, as in the OpenGL version (and as a fallback if the fit fails),
+the number of wavelengths is rounded up to a multiple of 3, and the matrix
+coefficients are the sRGB color matching functions times the wavelength
+spacing:
+*/
+
+  if (precompute_illuminance && wavelength_rule != WavelengthRule::kMidpoint) {
+    const std::vector<double> nodes =
+        wavelength_rule == WavelengthRule::kFitted6
+            ? std::vector<double>(std::begin(kFitted6Wavelengths),
+                                  std::end(kFitted6Wavelengths))
+            : std::vector<double>(std::begin(kFitted9Wavelengths),
+                                  std::end(kFitted9Wavelengths));
+    const std::vector<std::array<double, 3>> weights =
+        FitWavelengthRuleWeights(nodes, wavelengths, solar_irradiance,
+            rayleigh_scattering, mie_extinction, absorption_extinction,
+            ComputeVerticalColumn(rayleigh_density, bottom_radius,
+                                  top_radius),
+            ComputeVerticalColumn(mie_density, bottom_radius, top_radius),
+            ComputeVerticalColumn(absorption_density, bottom_radius,
+                                  top_radius));
+    // Each pass uses 3 consecutive nodes (the number of nodes of the fitted
+    // rules is a multiple of 3). If the fit failed (empty weights), the
+    // midpoint rule is used instead (see below).
+    for (size_t i = 0; i + 2 < weights.size(); i += 3) {
+      WavelengthPass pass;
+      for (int column = 0; column < 3; ++column) {
+        pass.lambdas[column] = nodes[i + column];
+        for (int row = 0; row < 3; ++row) {
+          pass.luminance_from_radiance[3 * row + column] =
+              static_cast<float>(weights[i + column][row]);
+        }
+      }
+      wavelength_passes_.push_back(pass);
+    }
+  }
+  if (precompute_illuminance && wavelength_passes_.empty()) {
+    const unsigned int num_iterations = (num_precomputed_wavelengths + 2) / 3;
+    // Note: kLambdaMin and kLambdaMax are 360 and 830 nm, as in the OpenGL
+    // version.
+    double dlambda =
+        static_cast<double>(kLambdaMax - kLambdaMin) / (3 * num_iterations);
+    for (unsigned int i = 0; i < num_iterations; ++i) {
+      vec3 lambdas{
+        kLambdaMin + (3 * i + 0.5) * dlambda,
+        kLambdaMin + (3 * i + 1.5) * dlambda,
+        kLambdaMin + (3 * i + 2.5) * dlambda
+      };
+      auto coeff = [dlambda](double lambda, int component) {
+        // Note that we don't include MAX_LUMINOUS_EFFICACY here, to avoid
+        // artefacts due to too large values when using half precision on GPU.
+        // We add this term back in the luminance API functions, via
+        // sky_spectral_radiance_to_luminance (see above).
+        return static_cast<float>(
+            SrgbColorMatchingFunction(lambda, component) * dlambda);
+      };
+      mat3 luminance_from_radiance{
+        coeff(lambdas[0], 0), coeff(lambdas[1], 0), coeff(lambdas[2], 0),
+        coeff(lambdas[0], 1), coeff(lambdas[1], 1), coeff(lambdas[2], 1),
+        coeff(lambdas[0], 2), coeff(lambdas[1], 2), coeff(lambdas[2], 2)
+      };
+      wavelength_passes_.push_back({lambdas, luminance_from_radiance});
+    }
+  }
 
   // Allocate the precomputed textures, but don't precompute them yet. Unlike
   // in OpenGL, RGB formats can't be used for unordered access views, so we
@@ -505,9 +859,11 @@ depend on whether we want to store precomputed irradiance or illuminance values:
 <code>kLambdaR</code>, <code>kLambdaG</code>, <code>kLambdaB</code>
 wavelengths, and with an identity luminance_from_radiance matrix.</li>
 <li>In precomputed illuminance mode, we need to precompute the scattering for
-<code>num_precomputed_wavelengths</code> wavelengths, 3 at a time, each time
-converting the results to luminance (with the
-<code>luminance_from_radiance</code> matrix), and accumulating them in the
+the wavelengths of each pass computed in the constructor, 3 at a time, each
+time converting the results to luminance (with the
+<code>luminance_from_radiance</code> matrix of this pass, whose coefficients
+can be negative with the signed sRGB color matching functions, and with the
+fitted rules), and accumulating them in the
 final textures (via the <code>blend</code> argument) or, with the
 <code>accumulate_in_float32</code> option, in temporary single precision
 textures converted to the final half precision textures at the end (see
@@ -630,8 +986,8 @@ the contributions are directly accumulated in the final textures:
   // Allocate an upload buffer for the constants of each group of 3 wavelengths
   // (plus one for the final transmittance pass in precomputed illuminance
   // mode), as well as a command list and a GPU timer.
-  const unsigned int num_iterations = num_precomputed_wavelengths_ <= 3
-      ? 1 : (num_precomputed_wavelengths_ + 2) / 3;
+  const unsigned int num_iterations = wavelength_passes_.empty()
+      ? 1 : static_cast<unsigned int>(wavelength_passes_.size());
   d3d12::ComPtr<ID3D12Resource> constants_buffer;
   CD3DX12_HEAP_PROPERTIES upload_heap(D3D12_HEAP_TYPE_UPLOAD);
   auto buffer_desc =
@@ -676,44 +1032,17 @@ the contributions are directly accumulated in the final textures:
   command_list->SetDescriptorHeaps(1, heaps);
   command_list->SetComputeRootSignature(programs.root_signature.Get());
 
-  if (num_precomputed_wavelengths_ <= 3) {
+  if (wavelength_passes_.empty()) {
     vec3 lambdas{kLambdaR, kLambdaG, kLambdaB};
     mat3 luminance_from_radiance{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
     Precompute(command_list.Get(), &timer, programs, textures,
         set_constants(0, lambdas, luminance_from_radiance),
         false /* blend */, num_scattering_orders);
   } else {
-    // Note: kLambdaMin and kLambdaMax are 360 and 830 nm, as in the OpenGL
-    // version.
-    double dlambda =
-        static_cast<double>(kLambdaMax - kLambdaMin) / (3 * num_iterations);
     for (unsigned int i = 0; i < num_iterations; ++i) {
-      vec3 lambdas{
-        kLambdaMin + (3 * i + 0.5) * dlambda,
-        kLambdaMin + (3 * i + 1.5) * dlambda,
-        kLambdaMin + (3 * i + 2.5) * dlambda
-      };
-      auto coeff = [dlambda](double lambda, int component) {
-        // Note that we don't include MAX_LUMINOUS_EFFICACY here, to avoid
-        // artefacts due to too large values when using half precision on GPU.
-        // We add this term back in the luminance API functions, via
-        // sky_spectral_radiance_to_luminance (see also the comments in the
-        // Model constructor).
-        double x = CieColorMatchingFunctionTableValue(lambda, 1);
-        double y = CieColorMatchingFunctionTableValue(lambda, 2);
-        double z = CieColorMatchingFunctionTableValue(lambda, 3);
-        return static_cast<float>((
-            XYZ_TO_SRGB[component * 3] * x +
-            XYZ_TO_SRGB[component * 3 + 1] * y +
-            XYZ_TO_SRGB[component * 3 + 2] * z) * dlambda);
-      };
-      mat3 luminance_from_radiance{
-        coeff(lambdas[0], 0), coeff(lambdas[1], 0), coeff(lambdas[2], 0),
-        coeff(lambdas[0], 1), coeff(lambdas[1], 1), coeff(lambdas[2], 1),
-        coeff(lambdas[0], 2), coeff(lambdas[1], 2), coeff(lambdas[2], 2)
-      };
+      const WavelengthPass& pass = wavelength_passes_[i];
       Precompute(command_list.Get(), &timer, programs, textures,
-          set_constants(i, lambdas, luminance_from_radiance),
+          set_constants(i, pass.lambdas, pass.luminance_from_radiance),
           i > 0 /* blend */, num_scattering_orders);
     }
 

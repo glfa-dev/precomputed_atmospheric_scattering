@@ -110,8 +110,12 @@ struct AtmosphereSettings {
   // Whether to accumulate the precomputations in single precision textures,
   // converted to half precision at the end (only with half precision).
   bool accumulate_in_float32 = false;
-  // The number of wavelengths in precomputed luminance mode.
+  // The number of wavelengths in precomputed luminance mode (with the
+  // midpoint rule).
   int num_precomputed_wavelengths = 15;
+  // The wavelength integration rule in precomputed luminance mode (the
+  // fitted rules use a fixed number of wavelengths, see Model).
+  WavelengthRule wavelength_rule = WavelengthRule::kMidpoint;
   int num_scattering_orders = 4;
 };
 

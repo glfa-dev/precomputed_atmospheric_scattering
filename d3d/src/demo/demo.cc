@@ -361,7 +361,7 @@ coefficients are passed to the
         s.max_sun_zenith_angle_degrees / 180.0 * kPi, kLengthUnitInMeters,
         use_luminance_ == PRECOMPUTED ? s.num_precomputed_wavelengths : 3,
         s.use_combined_textures, s.use_half_precision,
-        s.accumulate_in_float32);
+        s.accumulate_in_float32, s.wavelength_rule);
     model->Init(s.num_scattering_orders);
   } catch (const std::exception& error) {
     error_message_ = error.what();
@@ -699,6 +699,24 @@ void Demo::HandleKey(char key) {
     settings_.accumulate_in_float32 = !settings_.accumulate_in_float32;
   } else if (key == 'c') {
     settings_.use_rgb_coefficients = !settings_.use_rgb_coefficients;
+  } else if (key == 'f') {
+    switch (settings_.wavelength_rule) {
+      case WavelengthRule::kMidpoint:
+        settings_.wavelength_rule = WavelengthRule::kFitted6;
+        break;
+      case WavelengthRule::kFitted6:
+        settings_.wavelength_rule = WavelengthRule::kFitted9;
+        break;
+      case WavelengthRule::kFitted9:
+        settings_.wavelength_rule = WavelengthRule::kMidpoint;
+        break;
+    }
+    // The rule is only used in precomputed luminance mode. In the other modes,
+    // the new value is used when switching to this mode (which re-creates the
+    // model).
+    if (use_luminance_ == PRECOMPUTED) {
+      model_dirty_ = true;
+    }
   } else if (key == 'l') {
     // Only the radiance mode is available with RGB coefficients.
     if (model_uses_rgb_coefficients_) {

@@ -64,7 +64,8 @@ GPU based validation).
 ## Controls
 
 The demo window contains all the options of the OpenGL demo, which can also be
-changed with the same keyboard shortcuts:
+changed with the same keyboard shortcuts, as well as some options specific to
+this port (`a`, `c` and `f` below):
 
 - mouse drag, CTRL + mouse drag, mouse wheel: view and Sun directions, distance,
 - `1`-`9`: predefined views, `+`/`-`: exposure,
@@ -73,6 +74,13 @@ changed with the same keyboard shortcuts:
   floats, and converted once to half precision at the end; only with half
   precision, mostly useful in precomputed luminance mode with many
   wavelengths), `l`: luminance mode, `w`: white balance,
+- `f`: wavelength rule in precomputed luminance mode (midpoint with N
+  wavelengths, as in the OpenGL version, then 6 or 9 fitted wavelengths, whose
+  weights are fitted to the atmosphere spectra: more accurate colors in fewer
+  precomputation passes for Earth-like atmospheres, best with `a`; the fitted
+  wavelengths are optimized for the default atmosphere, and with very different
+  spectra, e.g. much more ozone, a 30-60 wavelengths midpoint rule can be more
+  accurate),
 - `c`: Rec.709 band-averaged coefficients (the wavelength dependent parameters
   are averaged over the linear sRGB channels, weighted by the solar spectrum,
   instead of being sampled at 680, 550 and 440nm; radiance mode only),

@@ -280,8 +280,32 @@ void Demo::DrawAtmosphereWindow() {
                                   "%.1f");
     changed |= ImGui::SliderInt("Scattering orders",
                                 &s.num_scattering_orders, 1, 10);
+    const char* kWavelengthRules[] = {"Midpoint (N wavelengths)",
+                                      "Fitted, 6 wavelengths",
+                                      "Fitted, 9 wavelengths"};
+    int wavelength_rule = static_cast<int>(s.wavelength_rule);
+    if (ImGui::Combo("Wavelength rule (f)", &wavelength_rule,
+                     kWavelengthRules, 3)) {
+      s.wavelength_rule = static_cast<WavelengthRule>(wavelength_rule);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "How the spectral precomputations are integrated into sRGB, in\n"
+          "precomputed luminance mode. Midpoint: N evenly spaced wavelengths\n"
+          "weighted by the color matching functions. Fitted: 6 or 9 optimized\n"
+          "wavelengths, with weights fitted to the atmosphere spectra (more\n"
+          "accurate colors for Earth-like atmospheres, in 2 or 3 passes\n"
+          "instead of N/3; best with 32-bit accumulation). The fitted\n"
+          "wavelengths are optimized for the default atmosphere: with very\n"
+          "different spectra (e.g. much more ozone), a midpoint rule with\n"
+          "30-60 wavelengths can be more accurate. Only used in precomputed\n"
+          "luminance mode.");
+    }
+    ImGui::BeginDisabled(s.wavelength_rule != WavelengthRule::kMidpoint);
     changed |= ImGui::SliderInt("Wavelengths (precomputed luminance)",
                                 &s.num_precomputed_wavelengths, 4, 60);
+    ImGui::EndDisabled();
     changed |= ImGui::Checkbox("Combined textures", &s.use_combined_textures);
     changed |= ImGui::Checkbox("Half precision", &s.use_half_precision);
   }

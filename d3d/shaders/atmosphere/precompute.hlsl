@@ -41,7 +41,12 @@ entry point of this file separately, with the following preprocessor macros:
 <li>the texture sizes (see <a href="definitions.hlsli.html">definitions.hlsli
 </a>),</li>
 <li><code>COMBINED_SCATTERING_TEXTURES</code>, if the single Mie scattering must
-be packed in the alpha channel of the scattering texture.</li>
+be packed in the alpha channel of the scattering texture,</li>
+<li><code>SUN_TRANSMITTANCE_SPECTRUM_SIZE</code>, only for the
+<code>ComputeSunTransmittanceCS</code> entry point (see below), which is only
+defined when this macro is defined (the other macros returned by
+<code>Model::shader_defines()</code>, such as
+<code>SPECTRAL_SUN_TRANSMITTANCE</code>, are not used in this file).</li>
 </ul>
 
 <p>Compared to the GLSL version, which renders one quad per texture layer, with
@@ -54,7 +59,9 @@ controlled by a bit mask (bit <i>i</i> enables blending for output <i>i</i>).
 
 <h3>Resources</h3>
 
-<p>All the shaders in this file use the same root signature, declared in HLSL
+<p>All the shaders in this file use the same root signature (except
+<code>ComputeSunTransmittanceCS</code>, which uses an extended version of it,
+see below), declared in HLSL
 so that the C++ code can create it directly from the compiled shader. It uses
 <a href="https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_6_DynamicResources.html"
 >Shader Model 6.6 dynamic resources</a>: the textures are accessed via indices
@@ -280,7 +287,7 @@ void ComputeIndirectIrradianceCS(uint3 texel : SV_DispatchThreadID) {
 }
 
 /*
-<p>Finally, the multiple scattering shader computes the multiple scattering for
+<p>The multiple scattering shader computes the multiple scattering for
 the current scattering order, from the scattering density computed above, stores
 it in the delta multiple scattering texture, and accumulates it, converted to
 luminance and divided by the Rayleigh phase function, in the scattering texture
@@ -312,3 +319,100 @@ void ComputeMultipleScatteringCS(uint3 texel : SV_DispatchThreadID) {
           RayleighPhaseFunction(nu),
       0.0));
 }
+
+/*
+<p>With the <code>accumulate_in_float32</code> option, the scattering orders
+(and the groups of 3 wavelengths) are accumulated in temporary single precision
+textures, instead of directly in the final half precision textures (see
+<code>Model::Init</code>), to avoid the accumulation of rounding errors. The
+following shader then converts these sums to half precision, once, by
+copying a single precision texture (whose shader resource view index is
+provided in the <code>multiple_scattering_texture</code> root constant) into
+the final half precision texture (<code>output0</code>):
+*/
+
+[RootSignature(PRECOMPUTE_ROOT_SIGNATURE)]
+[numthreads(8, 8, 1)]
+void ConvertToHalfCS(uint3 texel : SV_DispatchThreadID) {
+  if (any(texel >= uint3(SCATTERING_TEXTURE_WIDTH, SCATTERING_TEXTURE_HEIGHT,
+                         SCATTERING_TEXTURE_DEPTH))) {
+    return;
+  }
+  Texture3D<float4> input =
+      ResourceDescriptorHeap[resources.multiple_scattering_texture];
+  RWTexture3D<float4> output = ResourceDescriptorHeap[resources.output0];
+  output[texel] = input[texel];
+}
+
+/*
+<p>With the <code>spectral_sun_transmittance</code> option (see
+<a href="../../src/atmosphere/model.cc.html#sun_transmittance">model.cc</a>),
+the following shader computes the effective transmittance of the solar spectrum
+between each point and the top atmosphere boundary, for each linear sRGB
+channel, with the same parameterization as the transmittance texture. It needs
+the Rayleigh, Mie and absorption extinction coefficients (in inverse length
+units, in the <code>xyz</code> components) and the normalized weights of each
+channel (in the <code>rgb</code> components) at each wavelength between 360 and
+829nm, with a 1nm step. These tables are provided in an additional constant
+buffer, hence an additional root parameter (only used by this shader). The
+number of wavelengths, <code>SUN_TRANSMITTANCE_SPECTRUM_SIZE</code>, is
+provided by the C++ code with a macro, and this shader is only defined if this
+macro is defined:
+*/
+
+#ifdef SUN_TRANSMITTANCE_SPECTRUM_SIZE
+
+#define SUN_TRANSMITTANCE_ROOT_SIGNATURE \
+    PRECOMPUTE_ROOT_SIGNATURE "," \
+    "CBV(b2)"
+
+struct SunTransmittanceSpectrum {
+  float4 extinction[SUN_TRANSMITTANCE_SPECTRUM_SIZE];
+  float4 weights[SUN_TRANSMITTANCE_SPECTRUM_SIZE];
+};
+
+ConstantBuffer<SunTransmittanceSpectrum> sun_transmittance_spectrum
+    : register(b2);
+
+/*
+<p>The optical lengths to the top atmosphere boundary don't depend on the
+wavelength, so we compute them first, with the same function as for the
+transmittance texture. The effective transmittance is then the weighted sum of
+the spectral transmittances at each wavelength. Since the color matching
+functions can be negative, this sum can be slightly negative, which we clamp
+to 0:
+*/
+
+[RootSignature(SUN_TRANSMITTANCE_ROOT_SIGNATURE)]
+[numthreads(8, 8, 1)]
+void ComputeSunTransmittanceCS(uint3 texel : SV_DispatchThreadID) {
+  if (any(texel.xy >= uint2(TRANSMITTANCE_TEXTURE_WIDTH,
+                            TRANSMITTANCE_TEXTURE_HEIGHT))) {
+    return;
+  }
+  const float2 TRANSMITTANCE_TEXTURE_SIZE =
+      float2(TRANSMITTANCE_TEXTURE_WIDTH, TRANSMITTANCE_TEXTURE_HEIGHT);
+  AtmosphereParameters atmosphere = constants.atmosphere;
+  float r;
+  float mu;
+  GetRMuFromTransmittanceTextureUv(
+      atmosphere, (texel.xy + 0.5) / TRANSMITTANCE_TEXTURE_SIZE, r, mu);
+  float3 optical_length = float3(
+      ComputeOpticalLengthToTopAtmosphereBoundary(
+          atmosphere, atmosphere.rayleigh_density, r, mu),
+      ComputeOpticalLengthToTopAtmosphereBoundary(
+          atmosphere, atmosphere.mie_density, r, mu),
+      ComputeOpticalLengthToTopAtmosphereBoundary(
+          atmosphere, atmosphere.absorption_density, r, mu));
+  float3 transmittance = (float3)0.0;
+  for (int i = 0; i < SUN_TRANSMITTANCE_SPECTRUM_SIZE; ++i) {
+    float optical_depth =
+        dot(sun_transmittance_spectrum.extinction[i].xyz, optical_length);
+    transmittance +=
+        sun_transmittance_spectrum.weights[i].rgb * exp(-optical_depth);
+  }
+  RWTexture2D<float4> output = ResourceDescriptorHeap[resources.output0];
+  output[texel.xy] = float4(max(transmittance, 0.0), 1.0);
+}
+
+#endif  // SUN_TRANSMITTANCE_SPECTRUM_SIZE

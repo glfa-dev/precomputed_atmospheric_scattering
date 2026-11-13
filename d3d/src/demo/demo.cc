@@ -47,6 +47,7 @@ textures used by the scene rendering shaders.
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <fstream>
 
 #include "atmosphere/constants.h"
 
@@ -107,7 +108,16 @@ struct DemoResources {
   uint32_t scattering_texture;
   uint32_t single_mie_scattering_texture;
   uint32_t irradiance_texture;
+  uint32_t sun_transmittance_texture;
+  uint32_t film_lut_texture;
+  uint32_t tone_mapping;
 };
+// Must be equal to the number of root constants declared in demo.hlsl.
+static_assert(sizeof(DemoResources) == 7 * sizeof(uint32_t));
+
+// The size of the film emulation LUT (see data/README.md), which must be equal
+// to the kFilmLutSize constant in demo.hlsl.
+constexpr uint32_t kFilmLutSize = 65;
 
 // The root constants of the LUT viewer shader (see lut_view.hlsl).
 struct LutViewParameters {
@@ -129,8 +139,10 @@ constexpr DXGI_FORMAT kRenderTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 <p>The class constructor is straightforward and completely independent of our
 atmosphere model (which is initialized in the separate method
 <code>InitModel</code>). It creates a constant buffer for each frame in flight
-(persistently mapped in an upload heap), and the texture used to display the
-precomputed textures in the LUT viewer:
+(persistently mapped in an upload heap), the texture used to display the
+precomputed textures in the LUT viewer, and the film emulation LUT used by the
+optional tone mapping (loaded from the <code>data</code> directory next to the
+<code>shaders</code> one):
 */
 
 Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
@@ -143,11 +155,14 @@ Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
     num_frames_in_flight_(num_frames_in_flight),
     use_luminance_(NONE),
     do_white_balance_(false),
+    use_film_lut_(false),
     show_ui_(true),
     model_dirty_(false),
     settings_modified_(false),
     init_time_milliseconds_(0.0),
     white_point_{1.0f, 1.0f, 1.0f},
+    model_uses_rgb_coefficients_(false),
+    rgb_coefficients_{},
     constants_data_(nullptr),
     view_distance_meters_(9000.0),
     view_zenith_angle_radians_(1.47),
@@ -177,6 +192,7 @@ Demo::Demo(d3d12::Device* device, d3d12::DescriptorHeap* descriptor_heap,
       SCATTERING_TEXTURE_HEIGHT, DXGI_FORMAT_R8G8B8A8_UNORM, true,
       L"LUT viewer texture");
 
+  LoadFilmLut(shader_directory.parent_path() / "data" / "film_lut_65.bin");
   InitModel();
 }
 
@@ -256,6 +272,88 @@ void Demo::InitModel() {
     ground_albedo.push_back(s.ground_albedo);
   }
 
+/*
+<p>By default the <code>Model</code> samples these wavelength dependent
+parameters at <code>kLambdaR</code>, <code>kLambdaG</code> and
+<code>kLambdaB</code> (680, 550 and 440nm) in radiance mode. This gives a
+greenish image (the solar spectrum is larger at 550nm than at 680nm, and the
+sRGB red channel is mostly sensitive around 600nm, not 680nm), and purplish
+twilights (680nm is in the weak tail of the ozone Chappuis absorption band,
+which peaks around 600nm). Optionally, we can instead replace each parameter
+$\beta(\lambda)$ with its average over each linear sRGB (i.e. Rec.709) channel
+$c$, weighted by the solar spectrum $S(\lambda)$ and by the sRGB color matching
+function $\bar{c}(\lambda)$:
+$$\beta_c=\frac{\int S(\lambda)\beta(\lambda)\bar{c}(\lambda)d\lambda}
+{\int S(\lambda)\bar{c}(\lambda)d\lambda}$$
+and the solar spectrum with its linear sRGB color $\int S\bar{c}d\lambda$
+(scaled by $10^{-5}$, like the luminance values in the luminance modes, so that
+the same exposure gives the same brightness in all modes). With these values, a single scattering
+event under a direct sunlight gives exactly the right sRGB color. But this is
+only an approximation for long optical paths, because the transmittance
+$\exp(-\int\beta)$ is not linear in $\beta$ (for instance, as the path length
+increases, the light which remains in each channel is concentrated at the
+wavelengths where the extinction is the smallest, which reduces the effective
+extinction coefficient of this channel). In practice, compared with the
+precomputed luminance mode, this removes the green tint of the default sampling
+in daylight and its purple tint at twilight, but gives slightly less red colors
+when the Sun is low, for the cost of a radiance precomputation. These RGB
+coefficients are passed to the
+<code>Model</code> as "spectra" sampled at exactly <code>kLambdaB</code>,
+<code>kLambdaG</code> and <code>kLambdaR</code>, so that the
+<code>Model</code> uses them unchanged:
+*/
+
+  std::vector<double> model_wavelengths = wavelengths;
+  std::vector<double> model_solar_irradiance = solar_irradiance;
+  std::array<std::vector<double>*, 5> coefficients = {
+      &rayleigh_scattering, &mie_scattering, &mie_extinction,
+      &absorption_extinction, &ground_albedo};
+  std::array<std::array<double, 3>, 6> rgb_coefficients = {};
+  if (s.use_rgb_coefficients) {
+    // Note: the RGB coefficients are only meaningful in radiance mode.
+    use_luminance_ = NONE;
+    auto to_srgb = [&wavelengths](const std::vector<double>& spectrum) {
+      std::array<double, 3> rgb;
+      Model::ConvertSpectrumToLinearSrgb(
+          wavelengths, spectrum, &rgb[0], &rgb[1], &rgb[2]);
+      return rgb;
+    };
+    const std::array<double, 3> solar_rgb = to_srgb(solar_irradiance);
+    // Same scale as the luminance modes, whose exposure is multiplied by 1e-5
+    // (see Render), so that the same exposure gives the same brightness.
+    constexpr double kLuminanceScale = 1e-5;
+    for (int c = 0; c < 3; ++c) {
+      rgb_coefficients[0][c] = solar_rgb[c] * kLuminanceScale;
+    }
+    for (size_t i = 0; i < coefficients.size(); ++i) {
+      std::vector<double> weighted(wavelengths.size());
+      for (size_t j = 0; j < wavelengths.size(); ++j) {
+        weighted[j] = solar_irradiance[j] * (*coefficients[i])[j];
+      }
+      const std::array<double, 3> weighted_rgb = to_srgb(weighted);
+      for (int c = 0; c < 3; ++c) {
+        // The signed sRGB color matching functions can yield slightly
+        // negative values (e.g. for the ozone absorption in the blue channel).
+        rgb_coefficients[i + 1][c] =
+            std::max(weighted_rgb[c] / solar_rgb[c], 0.0);
+      }
+    }
+    // The Model interpolates its input spectra at kLambdaR, kLambdaG and
+    // kLambdaB, and requires increasing wavelengths, hence the B,G,R order.
+    auto bgr = [](const std::array<double, 3>& rgb) {
+      return std::vector<double>{rgb[2], rgb[1], rgb[0]};
+    };
+    model_wavelengths = {Model::kLambdaB, Model::kLambdaG, Model::kLambdaR};
+    model_solar_irradiance = bgr(rgb_coefficients[0]);
+    for (size_t i = 0; i < coefficients.size(); ++i) {
+      *coefficients[i] = bgr(rgb_coefficients[i + 1]);
+    }
+  }
+
+/*
+<p>We can then create the <code>Model</code>:
+*/
+
   // The new model is first created and initialized separately, so that the
   // current one can be kept if this fails (e.g. because of a shader
   // compilation error).
@@ -263,8 +361,8 @@ void Demo::InitModel() {
   std::unique_ptr<Model> model;
   try {
     model = std::make_unique<Model>(device_, descriptor_heap_,
-        &shader_compiler_, wavelengths, solar_irradiance, s.sun_angular_radius,
-        s.bottom_radius, s.top_radius,
+        &shader_compiler_, model_wavelengths, model_solar_irradiance,
+        s.sun_angular_radius, s.bottom_radius, s.top_radius,
         std::vector<DensityProfileLayer>(s.rayleigh_density.begin(),
                                          s.rayleigh_density.end()),
         rayleigh_scattering,
@@ -276,7 +374,9 @@ void Demo::InitModel() {
         absorption_extinction, ground_albedo,
         s.max_sun_zenith_angle_degrees / 180.0 * kPi, kLengthUnitInMeters,
         use_luminance_ == PRECOMPUTED ? s.num_precomputed_wavelengths : 3,
-        s.use_combined_textures, s.use_half_precision);
+        s.use_combined_textures, s.use_half_precision,
+        s.accumulate_in_float32, s.wavelength_rule,
+        s.spectral_sun_transmittance);
     model->Init(s.num_scattering_orders);
   } catch (const std::exception& error) {
     error_message_ = error.what();
@@ -285,6 +385,10 @@ void Demo::InitModel() {
   init_time_milliseconds_ = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - start).count();
   model_ = std::move(model);
+  model_uses_rgb_coefficients_ = s.use_rgb_coefficients;
+  rgb_coefficients_ = rgb_coefficients;
+  // The white point is computed from the full solar spectrum, even with RGB
+  // coefficients (whose solar irradiance is the sRGB color of this spectrum).
   wavelengths_ = std::move(wavelengths);
   solar_irradiance_ = std::move(solar_irradiance);
   UpdateWhitePoint();
@@ -305,7 +409,75 @@ preprocessor macros corresponding to the model options:
 }
 
 /*
-<p>The white point used for the final "tone mapping" is either (1,1,1), or the
+<p>The film emulation LUT is stored as raw 32 bits float RGBA texels, with the
+red input varying fastest, then the green one, which is directly the layout of
+a 3D texture whose x, y and z coordinates are the red, green and blue inputs.
+We upload it once and for all to such a texture, with the
+<code>UpdateSubresources</code> helper of d3dx12 (which takes care of the row
+pitch alignment in the intermediate upload buffer). If the file is missing or
+invalid, the film LUT tone mapping is simply disabled:
+*/
+
+void Demo::LoadFilmLut(const std::filesystem::path& file) {
+  constexpr size_t kRowSize = kFilmLutSize * 4 * sizeof(float);
+  constexpr size_t kSliceSize = kFilmLutSize * kRowSize;
+  constexpr size_t kFileSize = kFilmLutSize * kSliceSize;
+  std::vector<char> data(kFileSize);
+  {
+    std::ifstream input(file, std::ios::binary | std::ios::ate);
+    if (!input) {
+      film_lut_error_ = "Can't open " + file.string();
+      return;
+    }
+    if (static_cast<size_t>(input.tellg()) != kFileSize) {
+      film_lut_error_ = file.string() + " is not a " +
+          std::to_string(kFilmLutSize) + "^3 float32 RGBA LUT";
+      return;
+    }
+    input.seekg(0);
+    if (!input.read(data.data(), kFileSize)) {
+      film_lut_error_ = "Can't read " + file.string();
+      return;
+    }
+  }
+
+  ID3D12Device* d3d_device = device_->device();
+  d3d12::Texture texture = d3d12::Texture::Create3d(
+      d3d_device, descriptor_heap_, kFilmLutSize, kFilmLutSize, kFilmLutSize,
+      DXGI_FORMAT_R32G32B32A32_FLOAT, false, L"Film LUT");
+  d3d12::ComPtr<ID3D12Resource> upload_buffer;
+  CD3DX12_HEAP_PROPERTIES upload_heap(D3D12_HEAP_TYPE_UPLOAD);
+  auto buffer_desc = CD3DX12_RESOURCE_DESC::Buffer(
+      GetRequiredIntermediateSize(texture.resource(), 0, 1));
+  D3D12_CHECK(d3d_device->CreateCommittedResource(
+      &upload_heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+      IID_PPV_ARGS(&upload_buffer)));
+
+  d3d12::ComPtr<ID3D12CommandAllocator> allocator;
+  d3d12::ComPtr<ID3D12GraphicsCommandList> command_list;
+  D3D12_CHECK(d3d_device->CreateCommandAllocator(
+      D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+  D3D12_CHECK(d3d_device->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+      IID_PPV_ARGS(&command_list)));
+  command_list->SetName(L"Film LUT upload");
+  D3D12_SUBRESOURCE_DATA subresource = {};
+  subresource.pData = data.data();
+  subresource.RowPitch = static_cast<LONG_PTR>(kRowSize);
+  subresource.SlicePitch = static_cast<LONG_PTR>(kSliceSize);
+  d3d12::Transition(command_list.Get(),
+                    {{&texture, D3D12_RESOURCE_STATE_COPY_DEST}});
+  UpdateSubresources(command_list.Get(), texture.resource(),
+                     upload_buffer.Get(), 0, 0, 1, &subresource);
+  d3d12::Transition(command_list.Get(),
+                    {{&texture, d3d12::Texture::kShaderResourceState}});
+  device_->ExecuteAndWait(command_list.Get());
+  film_lut_ = std::move(texture);
+}
+
+/*
+<p>The white point used for the final tone mapping is either (1,1,1), or the
 color of the solar spectrum, if white balance is enabled:
 */
 
@@ -516,15 +688,26 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
          sizeof(constants));
 
   // When the scattering textures are combined, the scattering texture is
-  // passed as the (unused) single Mie scattering texture.
+  // passed as the (unused) single Mie scattering texture. Likewise, without
+  // the spectral sun transmittance option, the transmittance texture is passed
+  // as the (unused) sun transmittance texture.
   const d3d12::Texture* single_mie_scattering_texture =
       model_->optional_single_mie_scattering_texture();
+  const d3d12::Texture* sun_transmittance_texture =
+      model_->optional_sun_transmittance_texture();
   DemoResources resources = {
     model_->transmittance_texture().srv(),
     model_->scattering_texture().srv(),
     single_mie_scattering_texture ? single_mie_scattering_texture->srv()
                                   : model_->scattering_texture().srv(),
-    model_->irradiance_texture().srv()
+    model_->irradiance_texture().srv(),
+    sun_transmittance_texture ? sun_transmittance_texture->srv()
+                              : model_->transmittance_texture().srv(),
+    // Any 3D texture can be used if the film LUT is not available (it is not
+    // used in this case).
+    film_lut_.resource() ? film_lut_.srv()
+                         : model_->scattering_texture().srv(),
+    use_film_lut_ && film_lut_.resource() ? 1u : 0u
   };
 
   D3D12_VIEWPORT viewport = {0.0f, 0.0f, static_cast<float>(width),
@@ -536,7 +719,8 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
   command_list->SetGraphicsRootConstantBufferView(
       0, constants_buffer_->GetGPUVirtualAddress() +
              frame_index * kConstantsSize);
-  command_list->SetGraphicsRoot32BitConstants(1, 4, &resources, 0);
+  command_list->SetGraphicsRoot32BitConstants(
+      1, sizeof(resources) / 4, &resources, 0);
   command_list->RSSetViewports(1, &viewport);
   command_list->RSSetScissorRects(1, &scissor);
   command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -548,17 +732,28 @@ void Demo::Render(ID3D12GraphicsCommandList* command_list,
 into an 8 bits texture which can then be displayed with Dear ImGui:
 */
 
-void Demo::RenderLutView(ID3D12GraphicsCommandList* command_list) {
-  const d3d12::Texture* textures[] = {
-    &model_->transmittance_texture(),
-    &model_->irradiance_texture(),
-    &model_->scattering_texture(),
-    model_->optional_single_mie_scattering_texture(),
+std::vector<std::pair<const char*, const d3d12::Texture*>>
+Demo::GetLutTextures() const {
+  const bool has_model = model_ != nullptr;
+  return {
+    {"Transmittance",
+     has_model ? &model_->transmittance_texture() : nullptr},
+    {"Irradiance", has_model ? &model_->irradiance_texture() : nullptr},
+    {"Scattering", has_model ? &model_->scattering_texture() : nullptr},
+    {"Single Mie scattering",
+     has_model ? model_->optional_single_mie_scattering_texture() : nullptr},
+    {"Sun transmittance",
+     has_model ? model_->optional_sun_transmittance_texture() : nullptr},
   };
-  const d3d12::Texture* source = textures[lut_index_];
-  if (source == nullptr) {
+}
+
+void Demo::RenderLutView(ID3D12GraphicsCommandList* command_list) {
+  const auto textures = GetLutTextures();
+  if (lut_index_ < 0 || lut_index_ >= static_cast<int>(textures.size()) ||
+      textures[lut_index_].second == nullptr) {
     return;
   }
+  const d3d12::Texture* source = textures[lut_index_].second;
   LutViewParameters parameters = {};
   parameters.source_texture = source->srv();
   parameters.is_3d = source->is_3d() ? 1 : 0;
@@ -602,7 +797,45 @@ void Demo::HandleKey(char key) {
     settings_.use_half_precision = !settings_.use_half_precision;
     settings_.max_sun_zenith_angle_degrees =
         settings_.use_half_precision ? 102.0 : 120.0;
+  } else if (key == 'a') {
+    // 32-bit accumulation is only available with half precision.
+    if (!settings_.use_half_precision) {
+      return;
+    }
+    settings_.accumulate_in_float32 = !settings_.accumulate_in_float32;
+  } else if (key == 'c') {
+    settings_.use_rgb_coefficients = !settings_.use_rgb_coefficients;
+  } else if (key == 'f') {
+    switch (settings_.wavelength_rule) {
+      case WavelengthRule::kMidpoint:
+        settings_.wavelength_rule = WavelengthRule::kFitted6;
+        break;
+      case WavelengthRule::kFitted6:
+        settings_.wavelength_rule = WavelengthRule::kFitted9;
+        break;
+      case WavelengthRule::kFitted9:
+        settings_.wavelength_rule = WavelengthRule::kMidpoint;
+        break;
+    }
+    // The rule is only used in precomputed luminance mode. In the other modes,
+    // the new value is used when switching to this mode (which re-creates the
+    // model).
+    if (use_luminance_ == PRECOMPUTED) {
+      model_dirty_ = true;
+    }
+  } else if (key == 'u') {
+    settings_.spectral_sun_transmittance =
+        !settings_.spectral_sun_transmittance;
+    // As for the wavelength rule, this option is only used in precomputed
+    // luminance mode.
+    if (use_luminance_ == PRECOMPUTED) {
+      model_dirty_ = true;
+    }
   } else if (key == 'l') {
+    // Only the radiance mode is available with RGB coefficients.
+    if (model_uses_rgb_coefficients_) {
+      return;
+    }
     switch (use_luminance_) {
       case NONE: use_luminance_ = APPROXIMATE; break;
       case APPROXIMATE: use_luminance_ = PRECOMPUTED; break;
@@ -611,6 +844,11 @@ void Demo::HandleKey(char key) {
   } else if (key == 'w') {
     do_white_balance_ = !do_white_balance_;
     UpdateWhitePoint();
+  } else if (key == 'm') {
+    // The film LUT tone mapping is only available if the LUT could be loaded.
+    if (film_lut_.resource()) {
+      use_film_lut_ = !use_film_lut_;
+    }
   } else if (key == '+') {
     exposure_ *= 1.1;
   } else if (key == '-') {
@@ -634,7 +872,8 @@ void Demo::HandleKey(char key) {
   } else if (key == '9') {
     SetView(1.2e7, 0.0, 0.0, 0.93, -2.0, 10.0);
   }
-  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'l') {
+  if (key == 's' || key == 'o' || key == 't' || key == 'p' || key == 'a' ||
+      key == 'l' || key == 'c') {
     model_dirty_ = true;
   }
 }

@@ -42,7 +42,11 @@ view ray with the shadow volume of S, in order to compute light shafts.
 <p>This file is compiled by the C++ demo with the preprocessor macros of the
 atmosphere model (see <code>Model::shader_defines()</code>), plus
 <code>USE_LUMINANCE</code> to render luminance values instead of radiance
-values, and <code>LENGTH_UNIT_IN_METERS</code>.
+values, and <code>LENGTH_UNIT_IN_METERS</code>. With the
+<code>SPECTRAL_SUN_TRANSMITTANCE</code> macro (only defined by the model in
+precomputed luminance mode), the Sun disc and the direct sunlight use the
+spectral sun transmittance texture (see
+<a href="../atmosphere/atmosphere.hlsli.html">atmosphere.hlsli</a>).
 
 <h3>Resources</h3>
 
@@ -54,7 +58,7 @@ descriptor heap indices provided in root constants:
 #define DEMO_ROOT_SIGNATURE \
     "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)," \
     "CBV(b0)," \
-    "RootConstants(num32BitConstants=4, b1)," \
+    "RootConstants(num32BitConstants=7, b1)," \
     "StaticSampler(s0," \
     "    filter=FILTER_MIN_MAG_MIP_LINEAR," \
     "    addressU=TEXTURE_ADDRESS_CLAMP," \
@@ -102,6 +106,14 @@ struct DemoResources {
   // Equal to scattering_texture if COMBINED_SCATTERING_TEXTURES is defined.
   uint single_mie_scattering_texture;
   uint irradiance_texture;
+  // Equal to transmittance_texture if SPECTRAL_SUN_TRANSMITTANCE is not
+  // defined.
+  uint sun_transmittance_texture;
+  // The film emulation LUT of the optional tone mapping (see below), or any 3D
+  // texture if it is not available.
+  uint film_lut_texture;
+  // 0 for the AgX tone mapping, 1 for the film emulation LUT.
+  uint tone_mapping;
 };
 
 ConstantBuffer<DemoResources> resources : register(b1);
@@ -206,7 +218,14 @@ float3 GetSunAndSkyIrradiance(float3 position, float3 normal,
       ResourceDescriptorHeap[resources.transmittance_texture];
   Texture2D<float4> irradiance_texture =
       ResourceDescriptorHeap[resources.irradiance_texture];
-#ifdef USE_LUMINANCE
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+  Texture2D<float4> sun_transmittance_texture =
+      ResourceDescriptorHeap[resources.sun_transmittance_texture];
+  return GetSpectralSunAndSkyIlluminance(atmosphere,
+      sky_spectral_radiance_to_luminance, sun_spectral_radiance_to_luminance,
+      sun_transmittance_texture, irradiance_texture, lut_sampler, position,
+      normal, sun_direction, sky_irradiance);
+#elif defined(USE_LUMINANCE)
   return GetSunAndSkyIlluminance(atmosphere,
       sky_spectral_radiance_to_luminance, sun_spectral_radiance_to_luminance,
       transmittance_texture, irradiance_texture, lut_sampler, position, normal,
@@ -217,6 +236,15 @@ float3 GetSunAndSkyIrradiance(float3 position, float3 normal,
       sky_irradiance);
 #endif
 }
+
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+float3 GetSunTransmittance(float3 camera, float3 direction) {
+  Texture2D<float4> sun_transmittance_texture =
+      ResourceDescriptorHeap[resources.sun_transmittance_texture];
+  return GetSunTransmittance(atmosphere, sun_transmittance_texture,
+      lut_sampler, camera, direction);
+}
+#endif
 
 /*<h3>Shadows and light shafts</h3>
 
@@ -373,6 +401,197 @@ void GetSphereShadowInOut(float3 view_direction, float3 sun_direction,
   }
 }
 
+/*<h3>Tone mapping</h3>
+
+<p>The final radiance (or luminance) values must be mapped to displayable
+values. A simple per channel curve such as $1-\exp(-x)$ compresses each
+channel independently, which shifts the hue of bright saturated colors (e.g.
+the low Sun turns yellow then white, with a sharp split where its blue
+component becomes 0). Instead, we use
+<a href="https://github.com/sobotka/AgX">AgX</a>, which first mixes the color
+channels with an "inset" matrix (so that very bright colors desaturate
+smoothly towards white), then applies a sigmoid curve in log2 space (covering
+16.5 stops around middle gray), and finally an "outset" matrix restoring some
+of the chroma. The following code is a port of the AgX implementation of the
+<a href="https://godotengine.org">Godot Engine</a> (version 4.4-stable,
+<code>servers/rendering/renderer_rd/shaders/effects/tonemap.glsl</code>), which
+is distributed under the license below (Godot's code is itself an
+approximation of <a href="https://github.com/EaryChow/AgX_LUT_Gen">EaryChow's
+AgX</a>, used by Blender). Note that AgX expects linear sRGB (Rec.709) inputs,
+which is only approximately the case in radiance mode, where the RGB channels
+are the spectral radiance at 680, 550 and 440nm (unless the Rec.709
+band-averaged coefficients option is used). The Godot license is:
+
+<pre>
+Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
+Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</pre>
+
+<p>The sigmoid curve is approximated with a polynomial (fitted by the Godot
+authors to EaryChow's curve):
+*/
+
+float3 AgxContrastApprox(float3 x) {
+  float3 x2 = x * x;
+  float3 x4 = x2 * x2;
+  return 0.021 * x + 4.0111 * x2 - 25.682 * x2 * x + 70.359 * x4 -
+      74.778 * x4 * x + 27.069 * x4 * x2;
+}
+
+/*
+<p>The AgX transform itself takes and returns linear sRGB values. Note that the
+GLSL matrices are column major, and are used as <code>M * color</code>. We use
+the same coefficients in the same order in HLSL, where they define the rows of
+the matrices, with <code>mul(color, M)</code>, which gives the same result:
+*/
+
+float3 AgxToneMap(float3 color) {
+  // Combined linear sRGB to linear Rec 2020 and Blender AgX inset matrices.
+  static const float3x3 kSrgbToRec2020AgxInset = float3x3(
+      0.54490813676363087053, 0.14044005884001287035, 0.088827411851915368603,
+      0.37377945959812267119, 0.75410959864013760045, 0.17887712465043811023,
+      0.081384976686407536266, 0.10543358536857773485, 0.73224999956948382528);
+  // Combined inverse AgX outset and linear Rec 2020 to linear sRGB matrices.
+  static const float3x3 kAgxOutsetRec2020ToSrgb = float3x3(
+      1.9645509602733325934, -0.29932243390911083839, -0.16436833806080403409,
+      -0.85585845117807513559, 1.3264510741502356555, -0.23822464068860595117,
+      -0.10886710826831608324, -0.027084020983874825605, 1.402665347143271889);
+  // log2(pow(2, -10) * 0.18) and log2(pow(2, 6.5) * 0.18), i.e. 10 stops
+  // below and 6.5 stops above middle gray.
+  static const float kMinEv = -12.4739311883324;
+  static const float kMaxEv = 4.02606881166759;
+
+  // Negative inputs are not supported (and 2e-10 avoids log2(0) after the
+  // inset matrix).
+  color = max(color, 2e-10);
+  color = mul(color, kSrgbToRec2020AgxInset);
+  // Log2 encoding, clamped to [0,1] for the polynomial approximation.
+  color = (clamp(log2(color), kMinEv, kMaxEv) - kMinEv) / (kMaxEv - kMinEv);
+  color = AgxContrastApprox(color);
+  // Back to linear, then outset matrix and conversion back to linear sRGB.
+  color = pow(color, 2.4);
+  return mul(color, kAgxOutsetRec2020ToSrgb);
+}
+
+/*
+<p>The result, clamped to [0,1], is then encoded with the sRGB transfer
+function (the swap chain uses a UNORM format):
+*/
+
+float3 LinearToSrgb(float3 color) {
+  color = saturate(color);
+  return select(color <= 0.0031308,
+      12.92 * color, 1.055 * pow(color, 1.0 / 2.4) - 0.055);
+}
+
+/*
+<h3>Film emulation LUT</h3>
+
+<p>Optionally, AgX can be replaced with a more "aesthetic" tone mapping, defined
+by a 3D lookup table (LUT) baked from a film emulation model (see
+<code>data/README.md</code>). This LUT takes linear Rec.709 values (with middle
+gray at 0.18, as for AgX), and directly returns the final display values,
+already encoded with the sRGB transfer function. Its 65 samples per channel are
+not spaced linearly but logarithmically: the input values are first encoded
+with a "shaper" function, which covers 8 stops below and above middle gray in
+log2 space, extended below this range with a linear "toe" through the origin
+(tangent to the log2 curve, so that 0 maps to 0). The constants below must be
+the ones used to bake the LUT:
+*/
+
+static const float kFilmLutSize = 65.0;
+static const float kFilmLutMidGray = 0.18;
+static const float kFilmLutMinStops = -8.0;
+static const float kFilmLutMaxStops = 8.0;
+
+float3 FilmLutShaper(float3 color) {
+  const float kRange = kFilmLutMaxStops - kFilmLutMinStops;
+  // The toe ends 1/ln(2) stops above the minimum of the log2 range, where the
+  // tangent of the log2 curve passes through the origin.
+  const float kToeEnd =
+      kFilmLutMidGray * exp2(kFilmLutMinStops + 1.0 / log(2.0));
+  const float kToeSlope = 1.0 / (kToeEnd * log(2.0) * kRange);
+  // Negative values and NaNs are mapped to 0.
+  color = max(color, 0.0);
+  float3 log_code = (log2(max(color, kToeEnd)) -
+      (log2(kFilmLutMidGray) + kFilmLutMinStops)) / kRange;
+  return saturate(select(color < kToeEnd, color * kToeSlope, log_code));
+}
+
+/*
+<p>The LUT is sampled with a tetrahedral interpolation, instead of the
+trilinear interpolation of the texture sampler. For this, the LUT cell
+containing the shaped value is split into 6 tetrahedra which all share the main
+diagonal between the cell corners $c_{000}$ and $c_{111}$. With the fractional
+coordinates in the cell sorted as $f_{max}\ge f_{mid}\ge f_{min}$, the result
+is $(1-f_{max})c_{000}+(f_{max}-f_{mid})c_1+(f_{mid}-f_{min})c_2+f_{min}
+c_{111}$, where $c_1$ is the corner along the axis of $f_{max}$, and $c_2$ the
+corner along the axes of $f_{max}$ and $f_{mid}$. This needs only 4 texel
+loads, uses full precision weights, and the neutral colors (with equal
+fractional coordinates) only depend on the neutral samples of the LUT:
+*/
+
+float3 SampleFilmLut(Texture3D<float4> lut, float3 code) {
+  float3 p = saturate(code) * (kFilmLutSize - 1.0);
+  float3 base = min(floor(p), kFilmLutSize - 2.0);
+  float3 f = p - base;
+
+  bool x_ge_y = f.x >= f.y;
+  bool y_ge_z = f.y >= f.z;
+  bool x_ge_z = f.x >= f.z;
+  // Axis of the largest fraction (ties prefer x, then y).
+  int3 o1 = (x_ge_y && x_ge_z) ? int3(1, 0, 0) :
+      (y_ge_z ? int3(0, 1, 0) : int3(0, 0, 1));
+  // Axis of the smallest fraction (ties prefer z, then y), never equal to o1.
+  int3 o_min = (x_ge_z && y_ge_z) ? int3(0, 0, 1) :
+      (x_ge_y ? int3(0, 1, 0) : int3(1, 0, 0));
+  int3 o2 = int3(1, 1, 1) - o_min;
+
+  float f_max = max(f.x, max(f.y, f.z));
+  float f_min = min(f.x, min(f.y, f.z));
+  float f_mid = max(min(f.x, f.y), min(max(f.x, f.y), f.z));
+
+  int3 i0 = int3(base);
+  float3 c0 = lut.Load(int4(i0, 0)).rgb;
+  float3 c1 = lut.Load(int4(i0 + o1, 0)).rgb;
+  float3 c2 = lut.Load(int4(i0 + o2, 0)).rgb;
+  float3 c3 = lut.Load(int4(i0 + int3(1, 1, 1), 0)).rgb;
+  return c0 * (1.0 - f_max) + c1 * (f_max - f_mid) + c2 * (f_mid - f_min) +
+      c3 * f_min;
+}
+
+/*
+<p>Finally, the following function applies the selected tone mapping, and
+returns sRGB encoded display values:
+*/
+
+float3 ToneMap(float3 color) {
+  if (resources.tone_mapping != 0) {
+    Texture3D<float4> film_lut =
+        ResourceDescriptorHeap[resources.film_lut_texture];
+    return saturate(SampleFilmLut(film_lut, FilmLutShaper(color)));
+  }
+  return LinearToSrgb(AgxToneMap(color));
+}
+
 /*<h3>Main shading function</h3>
 
 <p>Using these functions we can now implement the main shader function, which
@@ -527,13 +746,19 @@ the scene:
       camera - earth_center, view_direction, shadow_length, sun_direction,
       transmittance);
 
-  // If the view ray intersects the Sun, add the Sun radiance.
+  // If the view ray intersects the Sun, add the Sun radiance (attenuated with
+  // the spectral sun transmittance, if available, which gives its exact color,
+  // instead of the transmittance of the view ray).
   if (dot(view_direction, sun_direction) > sun_size.y) {
+#if defined(USE_LUMINANCE) && defined(SPECTRAL_SUN_TRANSMITTANCE)
+    transmittance = GetSunTransmittance(camera - earth_center, view_direction);
+#endif
     radiance = radiance + transmittance * GetSolarRadiance();
   }
   radiance = lerp(radiance, ground_radiance, ground_alpha);
   radiance = lerp(radiance, sphere_radiance, sphere_alpha);
-  return float4(
-      pow((float3)1.0 - exp(-radiance / white_point * exposure), 1.0 / 2.2),
-      1.0);
+  // With the default exposure and the AgX tone mapping, this gives about the
+  // same mean display luminance as the 1 - exp(-x) curve of the OpenGL demo
+  // (0.93 to 1.18 times over the predefined views), with more contrast.
+  return float4(ToneMap(radiance / white_point * exposure), 1.0);
 }

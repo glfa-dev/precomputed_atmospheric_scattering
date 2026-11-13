@@ -119,19 +119,62 @@ void Demo::DrawDemoWindow() {
           settings_.use_half_precision ? 102.0 : 120.0;
       changed = true;
     }
+    ImGui::BeginDisabled(!settings_.use_half_precision);
+    changed |= ImGui::Checkbox("32-bit accumulation (a)",
+                               &settings_.accumulate_in_float32);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip(
+          "Accumulate the precomputation passes in 32-bit floats before\n"
+          "converting the results to half precision. Mostly useful in\n"
+          "precomputed luminance mode, with many wavelengths.");
+    }
+    ImGui::EndDisabled();
     const char* kLuminanceModes[] = {"Off (radiance)", "Approximate",
                                      "Precomputed"};
     int luminance = static_cast<int>(use_luminance_);
+    ImGui::BeginDisabled(model_uses_rgb_coefficients_);
     if (ImGui::Combo("Luminance (l)", &luminance, kLuminanceModes, 3)) {
       use_luminance_ = static_cast<Luminance>(luminance);
       changed = true;
     }
+    ImGui::EndDisabled();
+    if (model_uses_rgb_coefficients_) {
+      ImGui::TextDisabled("RGB coefficients: radiance mode only");
+    }
+    ImGui::BeginDisabled(use_luminance_ != PRECOMPUTED);
+    changed |= ImGui::Checkbox("Spectral sun transmittance (u)",
+                               &settings_.spectral_sun_transmittance);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip(
+          "Precompute the transmittance of the solar spectrum, integrated\n"
+          "over each sRGB channel, for exact colors of the Sun disc and of\n"
+          "the direct sunlight, and use extinction coefficients averaged\n"
+          "over each sRGB channel (instead of their values at 680, 550 and\n"
+          "440nm) for the aerial perspective. Fixes too red and too bright\n"
+          "sunsets. Only in precomputed luminance mode.");
+    }
+    ImGui::EndDisabled();
     if (changed) {
       model_dirty_ = true;
     }
     if (ImGui::Checkbox("White balance (w)", &do_white_balance_)) {
       UpdateWhitePoint();
     }
+    const char* kToneMappings[] = {"AgX", "Film LUT"};
+    int tone_mapping = use_film_lut_ ? 1 : 0;
+    ImGui::BeginDisabled(!film_lut_.resource());
+    if (ImGui::Combo("Tone mapping (m)", &tone_mapping, kToneMappings, 2)) {
+      use_film_lut_ = tone_mapping == 1;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+      if (film_lut_.resource()) {
+        ImGui::SetTooltip(
+            "AgX, or a film emulation 3D LUT (data/film_lut_65.bin).");
+      } else {
+        ImGui::SetTooltip("Film LUT unavailable: %s", film_lut_error_.c_str());
+      }
+    }
+    ImGui::EndDisabled();
   }
 
   if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -213,6 +256,24 @@ void Demo::DrawAtmosphereWindow() {
     changed |= InputDouble("Solar irradiance (W/m2/nm)",
                            &s.constant_solar_irradiance, "%.3f");
     ImGui::EndDisabled();
+    changed |= ImGui::Checkbox("Rec.709 band-averaged coefficients (c)",
+                               &s.use_rgb_coefficients);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Average the spectral parameters over the linear sRGB channels\n"
+          "(weighted by the solar spectrum) instead of sampling them at\n"
+          "680, 550 and 440nm. Radiance mode only.");
+    }
+    if (model_uses_rgb_coefficients_) {
+      const char* kNames[] = {"Solar irradiance", "Rayleigh scattering",
+                              "Mie scattering", "Mie extinction",
+                              "Absorption extinction", "Ground albedo"};
+      for (int i = 0; i < 6; ++i) {
+        const std::array<double, 3>& rgb = rgb_coefficients_[i];
+        ImGui::TextDisabled("%-21s %.4g, %.4g, %.4g", kNames[i], rgb[0],
+                            rgb[1], rgb[2]);
+      }
+    }
   }
 
   if (ImGui::CollapsingHeader("Rayleigh")) {
@@ -247,8 +308,32 @@ void Demo::DrawAtmosphereWindow() {
                                   "%.1f");
     changed |= ImGui::SliderInt("Scattering orders",
                                 &s.num_scattering_orders, 1, 10);
+    const char* kWavelengthRules[] = {"Midpoint (N wavelengths)",
+                                      "Fitted, 6 wavelengths",
+                                      "Fitted, 9 wavelengths"};
+    int wavelength_rule = static_cast<int>(s.wavelength_rule);
+    if (ImGui::Combo("Wavelength rule (f)", &wavelength_rule,
+                     kWavelengthRules, 3)) {
+      s.wavelength_rule = static_cast<WavelengthRule>(wavelength_rule);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "How the spectral precomputations are integrated into sRGB, in\n"
+          "precomputed luminance mode. Midpoint: N evenly spaced wavelengths\n"
+          "weighted by the color matching functions. Fitted: 6 or 9 optimized\n"
+          "wavelengths, with weights fitted to the atmosphere spectra (more\n"
+          "accurate colors for Earth-like atmospheres, in 2 or 3 passes\n"
+          "instead of N/3; best with 32-bit accumulation). The fitted\n"
+          "wavelengths are optimized for the default atmosphere: with very\n"
+          "different spectra (e.g. much more ozone), a midpoint rule with\n"
+          "30-60 wavelengths can be more accurate. Only used in precomputed\n"
+          "luminance mode.");
+    }
+    ImGui::BeginDisabled(s.wavelength_rule != WavelengthRule::kMidpoint);
     changed |= ImGui::SliderInt("Wavelengths (precomputed luminance)",
                                 &s.num_precomputed_wavelengths, 4, 60);
+    ImGui::EndDisabled();
     changed |= ImGui::Checkbox("Combined textures", &s.use_combined_textures);
     changed |= ImGui::Checkbox("Half precision", &s.use_half_precision);
   }
@@ -267,13 +352,31 @@ void Demo::DrawLutViewerWindow() {
     ImGui::End();
     return;
   }
-  const char* kTextures[] = {"Transmittance", "Irradiance", "Scattering",
-                             "Single Mie scattering"};
-  const int num_textures =
-      model_ && model_->optional_single_mie_scattering_texture() ? 4 : 3;
-  lut_index_ = std::min(lut_index_, num_textures - 1);
-  ImGui::Combo("Texture", &lut_index_, kTextures, num_textures);
-  const bool is_3d = lut_index_ >= 2;
+  // Each entry keeps the same meaning when the model options change. If the
+  // selected texture no longer exists, the transmittance texture is selected.
+  const auto textures = GetLutTextures();
+  const int num_textures = static_cast<int>(textures.size());
+  if (lut_index_ < 0 || lut_index_ >= num_textures ||
+      textures[lut_index_].second == nullptr) {
+    lut_index_ = 0;
+  }
+  if (ImGui::BeginCombo("Texture", textures[lut_index_].first)) {
+    for (int i = 0; i < num_textures; ++i) {
+      if (textures[i].second == nullptr) {
+        continue;
+      }
+      const bool selected = i == lut_index_;
+      if (ImGui::Selectable(textures[i].first, selected)) {
+        lut_index_ = i;
+      }
+      if (selected) {
+        ImGui::SetItemDefaultFocus();
+      }
+    }
+    ImGui::EndCombo();
+  }
+  const d3d12::Texture* texture = textures[lut_index_].second;
+  const bool is_3d = texture != nullptr && texture->is_3d();
   ImGui::BeginDisabled(!is_3d);
   ImGui::SliderInt("Slice (r)", &lut_slice_, 0, SCATTERING_TEXTURE_DEPTH - 1);
   ImGui::EndDisabled();
@@ -283,12 +386,9 @@ void Demo::DrawLutViewerWindow() {
 
   int width = TRANSMITTANCE_TEXTURE_WIDTH;
   int height = TRANSMITTANCE_TEXTURE_HEIGHT;
-  if (lut_index_ == 1) {
-    width = IRRADIANCE_TEXTURE_WIDTH;
-    height = IRRADIANCE_TEXTURE_HEIGHT;
-  } else if (is_3d) {
-    width = SCATTERING_TEXTURE_WIDTH;
-    height = SCATTERING_TEXTURE_HEIGHT;
+  if (texture != nullptr) {
+    width = static_cast<int>(texture->desc().Width);
+    height = static_cast<int>(texture->desc().Height);
   }
   // Display the texture with a width of 400 pixels, keeping its aspect ratio.
   const float kDisplayWidth = 400.0f;

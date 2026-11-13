@@ -78,13 +78,16 @@ set_target_properties(atmosphere_demo PROPERTIES
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY
   VS_STARTUP_PROJECT atmosphere_demo)
 
-# Copy the shaders and the DXC runtime libraries (dxil.dll is loaded
-# dynamically by dxcompiler.dll, to sign the compiled shaders) next to the
-# executable.
+# Copy the shaders, the data files (the film emulation LUT), and the DXC runtime
+# libraries (dxil.dll is loaded dynamically by dxcompiler.dll, to sign the
+# compiled shaders) next to the executable.
 add_custom_command(TARGET atmosphere_demo POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
     "$<TARGET_FILE_DIR:atmosphere_demo>/shaders"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/data"
+    "$<TARGET_FILE_DIR:atmosphere_demo>/data"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:Microsoft::DirectXShaderCompiler>"
     "$<TARGET_FILE_DIR:Microsoft::DirectXShaderCompiler>/dxil.dll"

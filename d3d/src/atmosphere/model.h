@@ -122,6 +122,27 @@ float3 GetSunAndSkyIlluminance(AtmosphereParameters atmosphere,
     SamplerState lut_sampler,
     float3 p, float3 normal, float3 sun_direction,
     out float3 sky_illuminance);
+
+// Only if SPECTRAL_SUN_TRANSMITTANCE is defined (see below): returns the
+// transmittance of the solar spectrum between 'camera' and the top atmosphere
+// boundary in direction 'direction', as a linear sRGB color ratio (to be
+// multiplied with GetSolarLuminance).
+float3 GetSunTransmittance(AtmosphereParameters atmosphere,
+    Texture2D&lt;float4&gt; sun_transmittance_texture,
+    SamplerState lut_sampler,
+    float3 camera, float3 direction);
+
+// Only if SPECTRAL_SUN_TRANSMITTANCE is defined: same as
+// GetSunAndSkyIlluminance, but with the sun illuminance computed with the
+// spectral sun transmittance texture.
+float3 GetSpectralSunAndSkyIlluminance(AtmosphereParameters atmosphere,
+    float3 sky_spectral_radiance_to_luminance,
+    float3 sun_spectral_radiance_to_luminance,
+    Texture2D&lt;float4&gt; sun_transmittance_texture,
+    Texture2D&lt;float4&gt; irradiance_texture,
+    SamplerState lut_sampler,
+    float3 p, float3 normal, float3 sun_direction,
+    out float3 sky_illuminance);
 </pre>
 
 <p>where
@@ -157,9 +178,16 @@ order),</li>
 <li>the other functions return luminance and illuminance values (in
 $cd.m^{-2}$ and $lx$) in linear <a href="https://en.wikipedia.org/wiki/SRGB">
 sRGB</a> space (i.e. before adjustements for gamma correction),</li>
-<li>all the functions return the (unitless) transmittance of the atmosphere
-along the specified segment at the 3 wavelengths <code>kLambdaR</code>,
-<code>kLambdaG</code>, <code>kLambdaB</code> (in this order).</li>
+<li>all the functions with a <code>transmittance</code> output parameter
+return in it the (unitless) transmittance of the atmosphere along the specified
+segment at the 3 wavelengths <code>kLambdaR</code>, <code>kLambdaG</code>,
+<code>kLambdaB</code> (in this order) - or, with the
+<code>spectral_sun_transmittance</code> option (see below), for extinction
+coefficients averaged over the linear sRGB channels,</li>
+<li><code>GetSunTransmittance</code> returns a (unitless) effective
+transmittance for each linear sRGB channel, i.e. the ratio between the linear
+sRGB color of the solar spectrum attenuated by the atmosphere along the
+specified ray, and the one of the unattenuated solar spectrum.</li>
 </ul>
 
 <p><b>Note</b> The precomputed atmosphere textures can store either irradiance
@@ -181,13 +209,32 @@ parameter):
   <a href="http://www.oskee.wz.cz/stranka/uploads/SCCG10ElekKmoch.pdf">Real-time
   Spectral Scattering in Large-scale Natural Participating Media</a>, section
   4.4 (i.e. <code>num_precomputed_wavelengths</code> irradiance values are
-  precomputed, and then converted to sRGB via a numerical integration of this
+  precomputed - or 6 or 9 values with a fitted <code>WavelengthRule</code>, see
+  below - and then converted to sRGB via a numerical integration of this
   spectrum with the CIE color matching functions). The API functions returning
   luminance values return these precomputed values (times the phase functions),
   while <i>the API functions returning radiance values are not provided</i>
   (i.e. the <code>RADIANCE_API_ENABLED</code> macro is not defined).
   </li>
 </ul>
+
+<p><b>Note</b> In precomputed illuminance mode, the scattering textures are
+integrated over the whole spectrum, but the transmittance texture (used for the
+Sun disc, the direct sunlight on surfaces, and the aerial perspective) still
+contains the transmittance at 3 wavelengths only, which gives wrong colors and
+luminances for long optical paths (e.g. at sunset). This D3D12 port provides an
+option, <code>spectral_sun_transmittance</code>, to reduce these errors. With
+this option the transmittance texture is computed with extinction coefficients
+averaged over the linear sRGB channels (instead of the values at
+<code>kLambdaR</code>, <code>kLambdaG</code>, <code>kLambdaB</code>), and an
+additional "spectral sun transmittance" texture is precomputed, giving the
+exact linear sRGB color of the Sun light after its attenuation from the top of
+the atmosphere to any point (see <a href="model.cc.html#sun_transmittance"
+>model.cc</a> for details). The shaders must then be compiled with the
+<code>SPECTRAL_SUN_TRANSMITTANCE</code> macro (included in
+<code>shader_defines()</code>), and should use <code>GetSunTransmittance</code>
+for the Sun disc and <code>GetSpectralSunAndSkyIlluminance</code> instead of
+<code>GetSunAndSkyIlluminance</code> (the other functions are unchanged).
 
 <p>The concrete API definition is the following. We start with the C++ mirrors
 of the HLSL structs used in constant buffers, which must follow the HLSL
@@ -298,6 +345,31 @@ class DensityProfileLayer {
 };
 
 /*
+<p>In precomputed illuminance mode (see above), the precomputed sRGB values are
+a numerical integral, over the wavelength, of the spectral results at a few
+wavelengths. This D3D12 port adds an option to choose the integration rule (the
+OpenGL version only provides the first one):
+*/
+
+enum class WavelengthRule {
+  // num_precomputed_wavelengths (rounded up to a multiple of 3) wavelengths,
+  // evenly spaced between 360 and 830nm, each weighted by the sRGB color
+  // matching functions at this wavelength times the wavelength spacing (as in
+  // the OpenGL version).
+  kMidpoint,
+  // 6 (resp. 9) wavelengths at fixed positions, optimized offline, with
+  // weights fitted at construction time to the model's own input spectra
+  // (see model.cc). With 2 (resp. 3) precomputations of 3 wavelengths, this
+  // gives colors close to converged ones for Earth-like atmospheres, much
+  // closer than the default 15 wavelengths midpoint rule (5 precomputations).
+  // The positions were optimized for the default Earth atmosphere: with very
+  // different spectra (e.g. a much larger amount of ozone), a midpoint rule
+  // with many wavelengths (30-60) can be more accurate.
+  kFitted6,
+  kFitted9
+};
+
+/*
 <p>The <code>Model</code> constructor takes the same atmosphere parameters as
 in the OpenGL version, plus the Direct3D objects needed to create the
 precomputed textures, and to compile the precomputation shaders:
@@ -404,7 +476,9 @@ class Model {
     // - otherwise, scattering is precomputed for this number of wavelengths
     // (rounded up to a multiple of 3), integrated with the CIE color matching
     // functions, and stored as illuminance values. Then only the
-    // luminance-based API functions are provided (see the above note).
+    // luminance-based API functions are provided (see the above note). The
+    // wavelengths and the integration weights depend on wavelength_rule (with
+    // a fitted rule, this number is only used to select this mode).
     unsigned int num_precomputed_wavelengths,
     // Whether to pack the (red component of the) single Mie scattering with the
     // Rayleigh and multiple scattering in a single texture, or to store the
@@ -413,7 +487,32 @@ class Model {
     // Whether to use half precision floats (16 bits) or single precision floats
     // (32 bits) for the precomputed textures. Half precision is sufficient for
     // most cases, except for very high exposure values.
-    bool half_precision);
+    bool half_precision,
+    // Whether to accumulate the precomputation results in temporary single
+    // precision textures, converted once to the final half precision textures
+    // at the end of Init, instead of directly in these final textures (this
+    // option has no effect if half_precision is false). In precomputed
+    // illuminance mode, the scattering textures are the sum of
+    // num_scattering_orders contributions for each group of 3 wavelengths, and
+    // each partial sum is rounded to half precision if accumulated directly in
+    // the final textures. With many wavelengths, this gives noticeable color
+    // errors, that this option avoids (at the cost of more temporary GPU memory
+    // during Init). It is also applied in precomputed irradiance mode, where it
+    // only avoids the (smaller) rounding errors of the scattering orders sum.
+    bool accumulate_in_float32 = false,
+    // The wavelengths and weights used to integrate the spectral results into
+    // illuminance values, in precomputed illuminance mode (ignored otherwise).
+    // For Earth-like atmospheres, the fitted rules give more accurate colors
+    // than the midpoint rule, with fewer wavelengths, i.e. a smaller
+    // precomputation time (best used with accumulate_in_float32, since their
+    // weights are larger and of both signs). If their weights can't be fitted
+    // (e.g. with a null solar spectrum), the midpoint rule is used instead.
+    WavelengthRule wavelength_rule = WavelengthRule::kMidpoint,
+    // Whether to compute the transmittance texture with extinction
+    // coefficients averaged over the linear sRGB channels, and to precompute
+    // the additional spectral sun transmittance texture (see above). Only
+    // used in precomputed illuminance mode (ignored otherwise).
+    bool spectral_sun_transmittance = false);
 
   ~Model();
 
@@ -444,6 +543,11 @@ class Model {
   const d3d12::Texture& irradiance_texture() const {
     return irradiance_texture_;
   }
+  // The spectral sun transmittance texture, or null if the
+  // spectral_sun_transmittance option is not used.
+  const d3d12::Texture* optional_sun_transmittance_texture() const {
+    return spectral_sun_transmittance_ ? &sun_transmittance_texture_ : nullptr;
+  }
 
   // The atmosphere parameters for the kLambdaR, kLambdaG, kLambdaB
   // wavelengths, to be provided to the HLSL API functions.
@@ -462,10 +566,15 @@ class Model {
   bool radiance_api_enabled() const {
     return num_precomputed_wavelengths_ <= 3;
   }
+  // Whether the spectral_sun_transmittance option is used (i.e. requested, in
+  // precomputed illuminance mode).
+  bool spectral_sun_transmittance() const {
+    return spectral_sun_transmittance_;
+  }
 
   // The preprocessor macros that shaders including atmosphere.hlsli must be
-  // compiled with (texture sizes, COMBINED_SCATTERING_TEXTURES and
-  // RADIANCE_API_ENABLED).
+  // compiled with (texture sizes, COMBINED_SCATTERING_TEXTURES,
+  // RADIANCE_API_ENABLED and SPECTRAL_SUN_TRANSMITTANCE).
   std::vector<d3d12::ShaderDefine> shader_defines() const;
 
   // The GPU time, in milliseconds, spent in each precomputation pass (summed
@@ -494,6 +603,12 @@ class Model {
   typedef std::array<float, 9> mat3;
   struct Programs;
   struct TemporaryTextures;
+  // The 3 wavelengths of a precomputation pass, and the matrix converting the
+  // spectral results at these wavelengths to (partial) luminance values.
+  struct WavelengthPass {
+    vec3 lambdas;
+    mat3 luminance_from_radiance;
+  };
 
   void Precompute(
       ID3D12GraphicsCommandList* command_list,
@@ -510,15 +625,29 @@ class Model {
   unsigned int num_precomputed_wavelengths_;
   bool combine_scattering_textures_;
   bool half_precision_;
+  bool accumulate_in_float32_;
+  // Whether the spectral_sun_transmittance option is requested and used (i.e.
+  // in precomputed illuminance mode).
+  bool spectral_sun_transmittance_;
+  // The precomputation passes in precomputed illuminance mode (computed in
+  // the constructor; empty in precomputed irradiance mode).
+  std::vector<WavelengthPass> wavelength_passes_;
   std::function<hlsl::AtmosphereParameters(const vec3&)>
       atmosphere_parameters_factory_;
   hlsl::AtmosphereParameters atmosphere_parameters_;
+  // With the spectral_sun_transmittance option, the atmosphere parameters used
+  // to compute the final transmittance texture (atmosphere_parameters_ with
+  // band-averaged extinction coefficients), and the spectral tables used to
+  // compute the sun transmittance texture (see model.cc).
+  hlsl::AtmosphereParameters transmittance_parameters_;
+  std::vector<std::array<float, 4>> sun_transmittance_spectrum_;
   hlsl::float3 sky_spectral_radiance_to_luminance_;
   hlsl::float3 sun_spectral_radiance_to_luminance_;
   d3d12::Texture transmittance_texture_;
   d3d12::Texture scattering_texture_;
   d3d12::Texture optional_single_mie_scattering_texture_;
   d3d12::Texture irradiance_texture_;
+  d3d12::Texture sun_transmittance_texture_;
   std::vector<std::pair<std::string, double>> precompute_timings_;
 };
 

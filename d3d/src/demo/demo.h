@@ -70,6 +70,12 @@ struct AtmosphereSettings {
   // Wavelength independent solar irradiance "spectrum" (not physically
   // realistic, but was used in the original implementation), in W/m^2/nm.
   double constant_solar_irradiance = 1.5;
+  // Whether to replace the wavelength dependent parameters with their averages
+  // over the 3 linear sRGB (Rec.709) channels, weighted by the solar spectrum
+  // and the sRGB color matching functions, instead of sampling them at
+  // kLambdaR, kLambdaG, kLambdaB (see Demo::InitModel). Only compatible with
+  // the radiance (i.e. non luminance) rendering mode.
+  bool use_rgb_coefficients = false;
   double sun_angular_radius = 0.00935 / 2.0;
   double bottom_radius = 6360000.0;
   double top_radius = 6420000.0;
@@ -101,8 +107,20 @@ struct AtmosphereSettings {
   double max_sun_zenith_angle_degrees = 102.0;
   bool use_combined_textures = true;
   bool use_half_precision = true;
-  // The number of wavelengths in precomputed luminance mode.
+  // Whether to accumulate the precomputations in single precision textures,
+  // converted to half precision at the end (only with half precision).
+  bool accumulate_in_float32 = false;
+  // The number of wavelengths in precomputed luminance mode (with the
+  // midpoint rule).
   int num_precomputed_wavelengths = 15;
+  // The wavelength integration rule in precomputed luminance mode (the
+  // fitted rules use a fixed number of wavelengths, see Model).
+  WavelengthRule wavelength_rule = WavelengthRule::kMidpoint;
+  // Whether to use the spectral sun transmittance option of the Model in
+  // precomputed luminance mode (exact colors for the Sun disc and the direct
+  // sunlight, band-averaged extinction coefficients for the aerial
+  // perspective).
+  bool spectral_sun_transmittance = false;
   int num_scattering_orders = 4;
 };
 
@@ -146,10 +164,16 @@ class Demo {
   };
 
   void InitModel();
+  void LoadFilmLut(const std::filesystem::path& file);
   void UpdateWhitePoint();
   void BuildPipelines();
   void ReloadShaders();
   void RenderLutView(ID3D12GraphicsCommandList* command_list);
+  // The textures which can be displayed in the LUT viewer, with their names,
+  // in a fixed order (lut_index_ is an index in this list). The optional
+  // textures which don't exist with the current model options are null.
+  std::vector<std::pair<const char*, const d3d12::Texture*>> GetLutTextures()
+      const;
   void SetView(double view_distance_meters, double view_zenith_angle_radians,
       double view_azimuth_angle_radians, double sun_zenith_angle_radians,
       double sun_azimuth_angle_radians, double exposure);
@@ -170,6 +194,9 @@ class Demo {
   AtmosphereSettings settings_;
   Luminance use_luminance_;
   bool do_white_balance_;
+  // Whether to use the film emulation LUT instead of AgX for the tone mapping
+  // (only if film_lut_ could be loaded).
+  bool use_film_lut_;
   bool show_ui_;
   // Whether the model must be re-created (because settings_ changed), and
   // whether the Atmosphere window has unapplied changes.
@@ -183,6 +210,16 @@ class Demo {
   std::vector<double> wavelengths_;
   std::vector<double> solar_irradiance_;
   float white_point_[3];
+  // Whether the current model uses RGB band-averaged coefficients, and their
+  // values (solar irradiance, Rayleigh scattering, Mie scattering, Mie
+  // extinction, absorption extinction and ground albedo, in R,G,B order).
+  bool model_uses_rgb_coefficients_;
+  std::array<std::array<double, 3>, 6> rgb_coefficients_;
+
+  // The film emulation LUT (empty if it could not be loaded, in which case
+  // film_lut_error_ contains the reason).
+  d3d12::Texture film_lut_;
+  std::string film_lut_error_;
 
   d3d12::ComPtr<ID3D12RootSignature> root_signature_;
   d3d12::ComPtr<ID3D12PipelineState> pipeline_state_;
